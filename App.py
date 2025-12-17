@@ -1,3 +1,5 @@
+import os
+from dotenv import load_dotenv
 import streamlit as st
 import pandas as pd
 import requests
@@ -72,8 +74,13 @@ for key in ["evrp_problem", "ortools_data", "tabu_result",
 # =========================================================
 DEPOT_LAT = 40.900
 DEPOT_LON = 29.300
-OPENCAGE_API_KEY = "5e24e80dddc04a62bd86dab415f5f8ef"
-DATA_DIR = Path(__file__).parent / "Data"
+BASE_DIR = Path(__file__).parent
+load_dotenv(BASE_DIR / ".env")
+OPENCAGE_API_KEY = os.getenv("OPENCAGE_API_KEY")
+
+if not OPENCAGE_API_KEY:
+    raise RuntimeError("OPENCAGE_API_KEY not found in environment")
+DATA_DIR = BASE_DIR / "Data"
 
 # =========================================================
 # LOAD TRAFFIC DATA (CONSTANT, ALWAYS LOADED)
@@ -125,7 +132,6 @@ from utils.parser import (
 from utils.parser import parse_mahalle_regex, parse_cadde, parse_sokak
 from utils.normalization_ai import ascii_fallback
 from utils.depot_distance_filter import depot_distance_feasibility
-from io import BytesIO
 
 
 # create OSRM client once
