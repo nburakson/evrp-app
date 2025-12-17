@@ -2,6 +2,7 @@ streamlit
 numpy
 pandas
 folium
+streamlit-folium
 matplotlib
 ortools
 requests
