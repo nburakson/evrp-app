@@ -1,0 +1,57 @@
+# =========================
+# Environment & secrets
+# =========================
+.env
+.env.*
+
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# Streamlit
+# =========================
+.streamlit/secrets.toml
+
+# =========================
+# OSRM & routing caches
+# =========================
+osrm_cache/
+cache/
+routes_cache.json
+
+# =========================
+# Generated / heavy artifacts
+# =========================
+*.pkl
+*.html
+
+# =========================
+# Temporary Excel files only
+# (REAL .xlsx files are allowed)
+# =========================
+~$*.xlsx
+*.xlsx~
+*.tmp
+
+# =========================
+# Jupyter (if any appear later)
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OS / IDE
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

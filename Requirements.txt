@@ -1,0 +1,11 @@
+streamlit
+numpy
+pandas
+folium
+matplotlib
+ortools
+requests
+urllib3
+polyline
+openpyxl
+python-dateutil
