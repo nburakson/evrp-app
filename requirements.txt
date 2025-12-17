@@ -11,3 +11,5 @@ polyline
 openpyxl
 python-dateutil
 python-dotenv
+scipy
+openai
