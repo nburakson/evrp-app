@@ -5,6 +5,7 @@ import time
 from functools import lru_cache
 from io import BytesIO
 import folium
+from pathlib import Path
 from streamlit_folium import st_folium
 import re
 import json
@@ -72,13 +73,14 @@ for key in ["evrp_problem", "ortools_data", "tabu_result",
 DEPOT_LAT = 40.900
 DEPOT_LON = 29.300
 OPENCAGE_API_KEY = "5e24e80dddc04a62bd86dab415f5f8ef"
+DATA_DIR = Path(__file__).parent / "Data"
 
 # =========================================================
 # LOAD TRAFFIC DATA (CONSTANT, ALWAYS LOADED)
 # =========================================================
 @st.cache_data
 def load_traffic_data():
-    path = r"C:\Users\burak.sonuparlak\Desktop\Elektrikli Araç C2C\EVRPORDERSAPP\Data\traffic_density_2024_clean_with_dayofweek.csv"
+    path = DATA_DIR / "traffic_density_2024_clean_with_dayofweek.csv"
     df = pd.read_csv(path)
     df.columns = [c.upper().strip() for c in df.columns]
     df = df[["LATITUDE", "LONGITUDE", "HOUR", "DAY_OF_WEEK", "AVG_SPEED_CLEAN"]]
@@ -169,9 +171,7 @@ def normalize_tr(s: str) -> str:
 # =========================================================
 @st.cache_data
 def load_mahalle_data():
-    df = pd.read_excel(
-        r"C:\Users\burak.sonuparlak\Desktop\Elektrikli Araç C2C\EVRPORDERSAPP\Data\Istanbul_Mahalle_Listesi.xlsx"
-    )
+    df = pd.read_excel(DATA_DIR / "Istanbul_Mahalle_Listesi.xlsx")
     df.columns = [c.lower() for c in df.columns]
     return df
 
