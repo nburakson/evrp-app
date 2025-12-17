@@ -2,9 +2,10 @@ import openai
 import os
 import re
 import unicodedata
+import streamlit as st
 
 # Load separate key for normalization only
-NORMALIZER_KEY = os.getenv("OPENAI_NORMALIZER_KEY")
+NORMALIZER_KEY = os.getenv("OPENAI_NORMALIZER_KEY") or st.secrets.get("OPENAI_NORMALIZER_KEY")
 openai.api_key = NORMALIZER_KEY
 
 
