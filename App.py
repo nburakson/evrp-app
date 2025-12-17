@@ -76,10 +76,11 @@ DEPOT_LAT = 40.900
 DEPOT_LON = 29.300
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
-OPENCAGE_API_KEY = os.getenv("OPENCAGE_API_KEY")
+OPENCAGE_API_KEY = os.getenv("OPENCAGE_API_KEY") or st.secrets.get("OPENCAGE_API_KEY")
 
 if not OPENCAGE_API_KEY:
-    raise RuntimeError("OPENCAGE_API_KEY not found in environment")
+    st.error("OPENCAGE_API_KEY not found. Set it as an environment variable or in Streamlit secrets.")
+    st.stop()
 DATA_DIR = BASE_DIR / "Data"
 
 # =========================================================
