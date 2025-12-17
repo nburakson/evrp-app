@@ -1,4 +1,5 @@
 import os
+from dotenv import load_dotenv
 import streamlit as st
 import pandas as pd
 import requests
@@ -73,11 +74,13 @@ for key in ["evrp_problem", "ortools_data", "tabu_result",
 # =========================================================
 DEPOT_LAT = 40.900
 DEPOT_LON = 29.300
+BASE_DIR = Path(__file__).parent
+load_dotenv(BASE_DIR / ".env")
 OPENCAGE_API_KEY = os.getenv("OPENCAGE_API_KEY")
 
 if not OPENCAGE_API_KEY:
     raise RuntimeError("OPENCAGE_API_KEY not found in environment")
-DATA_DIR = Path(__file__).parent / "Data"
+DATA_DIR = BASE_DIR / "Data"
 
 # =========================================================
 # LOAD TRAFFIC DATA (CONSTANT, ALWAYS LOADED)
