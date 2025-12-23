@@ -9,7 +9,7 @@ import pandas as pd
 CAPACITY_DESI = 4500                 # max load (desi)
 BATTERY_CAPACITY = 100                     # full battery energy
 ENERGY_A = 0.436              # empty vehicle kWh per km
-ENERGY_B = 0.002         # load energy penalty
+ENERGY_B = 0.00202         # load energy penalty
 
 # convert for EVRPProblem model (which uses per 100km)
 BASE_KWH_PER_100KM = ENERGY_A * 100   # = 43.6

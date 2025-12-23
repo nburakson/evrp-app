@@ -26,6 +26,7 @@ def visualize_routes_osrm(
         • Dynamic T_by_hour matrices (data["time_min_by_hour"])
         • Load-dependent EV energy model:
               E = 0.436 * distance + 0.002 * load_before_leg
+              
         • Battery-before/after, cumulative load, colored polylines.
     """
 
@@ -101,7 +102,7 @@ def visualize_routes_osrm(
         return float(T_by_hour[nearest][prev_node, node])
 
     def energy_color(E):
-        if E < 0.15: return "#00cc44"
+        if E < 0.0025: return "#00cc44"
         if E < 0.35: return "#ffcc00"
         return "#ff3300"
 
@@ -113,6 +114,14 @@ def visualize_routes_osrm(
     for v, route in enumerate(vehicle_routes):
         if not route:
             continue
+        
+        # Get original vehicle ID for color mapping (if FilteredSolution)
+        if hasattr(routing, 'get_original_vehicle_id'):
+            original_v = routing.get_original_vehicle_id(v)
+        else:
+            original_v = v
+        
+        vehicle_color = color_list[original_v % len(color_list)]
 
         prev_node = depot
         t_now = 0.0
@@ -171,7 +180,7 @@ def visualize_routes_osrm(
                 [row["Enlem"], row["Boylam"]],
                 tooltip=(
                     f"<b>Order ID:</b> {row['OrderID']}<br>"
-                    f"<b>Araç:</b> {v}<br>"
+                    f"<b>Araç:</b> {original_v + 1}<br>"
                     f"<b>Mesafe:</b> {d_km:.2f} km<br>"
                     f"<b>Süre:</b> {travel_min:.1f} dk<br>"
                     f"<b>LoadBefore:</b> {load_before_leg:.0f}<br>"
@@ -184,7 +193,7 @@ def visualize_routes_osrm(
                 ),
                 icon=BeautifyIcon(
                     number=str(row["OrderID"]),
-                    background_color=color_list[v % len(color_list)],
+                    background_color=vehicle_color,
                     text_color="white",
                     border_color="black",
                     border_width=2,
@@ -194,17 +203,17 @@ def visualize_routes_osrm(
             all_points.append((row["Enlem"], row["Boylam"]))
 
             # -----------------------
-            # POLYLINE (OSRM)
+            # POLYLINE (OSRM) - Use vehicle color instead of energy color
             # -----------------------
             seg = osrm_client.route(coords[prev_node], coords[node])
             if seg:
                 folium.PolyLine(
                     seg,
-                    color=energy_color(total_energy),
+                    color=vehicle_color,
                     weight=6,
                     opacity=0.85,
                     tooltip=folium.Tooltip(
-                        f"<b>Araç {v}</b><br>"
+                        f"<b>Araç {original_v + 1}</b><br>"
                         f"{prev_node} → {node}<br>"
                         f"Mesafe: {d_km:.2f} km<br>"
                         f"LoadBefore: {load_before_leg:.0f}<br>"
@@ -230,11 +239,11 @@ def visualize_routes_osrm(
         if seg:
             folium.PolyLine(
                 seg,
-                color=energy_color(total_energy),
+                color=vehicle_color,
                 weight=6,
                 opacity=0.85,
                 tooltip=folium.Tooltip(
-                    f"<b>Araç {v}</b><br>"
+                    f"<b>Araç {original_v + 1}</b><br>"
                     f"{prev_node} → Depot<br>"
                     f"Mesafe: {d_km:.2f} km<br>"
                     f"LoadBefore: {load_before_leg:.0f}<br>"

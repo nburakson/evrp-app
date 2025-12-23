@@ -17,12 +17,13 @@ MAX_ROUTE_MIN = WORK_END_MIN - WORK_START_MIN  # 540
 def leg_energy_kwh(d_km: float, load_before: float) -> float:
     """
     Energy model (kWh):
-      E = d_km * (0.436 + 0.002 * load_before)
+      E = d_km * 0.436 + 0.002 * load_before
 
     NOTE: load_before here is in "desi" in your pipeline; keep consistent.
     """
-    return float(d_km) * (0.436 + 0.002 * float(load_before))
 
+    #return float(d_km) * (0.436 + 0.002 * float(load_before))
+    return float(d_km) * 0.436 + 0.002 * float(load_before)
 
 def route_energy_objective_pickup(route, D, demand, depot=0) -> float:
     """
