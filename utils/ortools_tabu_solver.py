@@ -113,7 +113,7 @@ def solve_with_ortools_tabu(data, time_limit_s: int = 10, seed: int = 42):
         i = manager.IndexToNode(i_idx)
         j = manager.IndexToNode(j_idx)
         d_km = float(data["distance_km"][i, j])
-        return int(round(d_km * BASE_KWH_PER_KM))
+        return int(round(d_km * BASE_KWH_PER_KM ))
 
     energy_transit = routing.RegisterTransitCallback(energy_cb)
 
