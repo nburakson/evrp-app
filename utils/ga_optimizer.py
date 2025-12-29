@@ -22,8 +22,18 @@ def leg_energy_kwh(d_km: float, load_before: float) -> float:
     NOTE: load_before here is in "desi" in your pipeline; keep consistent.
     """
 
-    #return float(d_km) * (0.436 + 0.002 * float(load_before))
     return float(d_km) * 0.436 + 0.002 * float(load_before)
+
+
+def _base_energy_per_km(data) -> float:
+    """
+    Base kWh/km used by OR-Tools energy dimension (distance-only model).
+    Falls back to legacy constant if not provided.
+    """
+
+    if "base_kwh_per_100km" in data:
+        return float(data["base_kwh_per_100km"]) / 100.0
+    return 0.436
 
 def route_energy_objective_pickup(route, D, demand, depot=0) -> float:
     """
@@ -65,6 +75,8 @@ def _build_cost_context(data):
     depot = int(data.get("depot", 0))
     demand = np.asarray(data["demand_desi"], dtype=float)
     service = np.asarray(data["service_min"], dtype=float)
+    vehicle_cap = float(data.get("vehicle_cap_desi", 0.0))
+    battery_cap = float(data.get("battery_capacity", 0.0))
 
     # Time matrices
     T_static = None
@@ -81,6 +93,10 @@ def _build_cost_context(data):
         "depot": depot,
         "demand": demand,
         "service": service,
+        "vehicle_cap": vehicle_cap,
+        "battery_cap": battery_cap,
+        "num_vehicles": int(data.get("num_vehicles", 0)),
+        "base_energy_per_km": _base_energy_per_km(data),
         "T_static": T_static,
         "T_by_hour": T_by_hour,
         "hours_sorted": hours_sorted,
@@ -144,6 +160,107 @@ def route_time_penalty(route, ctx, depot=0, penalty_per_min=1e5) -> float:
     total_t = route_total_time_min(route, ctx, depot)
     overflow = max(0.0, total_t - MAX_ROUTE_MIN)
     return float(overflow) * float(penalty_per_min)
+
+
+def _build_routes_from_sequence(sequence, ctx):
+    """
+    Convert a flat customer permutation into vehicle routes while enforcing
+    OR-Tools style constraints (capacity, battery, workday).
+
+    Returns (routes, penalties).
+    """
+    num_vehicles = ctx["num_vehicles"]
+    cap = ctx["vehicle_cap"]
+    battery = ctx["battery_cap"]
+    base_energy = ctx["base_energy_per_km"]
+    D = ctx["D"]
+    depot = ctx["depot"]
+    demand = ctx["demand"]
+    service = ctx["service"]
+
+    routes = []
+    penalties = 0.0
+
+    v = 0
+    current = []
+    load = 0.0
+    energy = 0.0
+    t = 0.0
+    prev = depot
+
+    def finish_route():
+        nonlocal current, load, energy, t, prev
+        routes.append(current)
+        current = []
+        load = 0.0
+        energy = 0.0
+        t = 0.0
+        prev = depot
+
+    for node in sequence:
+        # If we already exceeded vehicle count, keep adding to last vehicle but penalize heavily.
+        if v >= num_vehicles:
+            penalties += 1e6
+
+        travel = _leg_time_min(prev, node, t, ctx)
+        leg_dist = float(D[prev, node])
+        leg_energy = leg_dist * base_energy
+        svc = float(service[node])
+
+        # Predict constraints including return to depot
+        projected_load = load + demand[node]
+        projected_energy = energy + leg_energy + float(D[node, depot]) * base_energy
+        projected_time = t + travel + svc + _leg_time_min(node, depot, t + travel + svc, ctx)
+
+        violates = (
+            projected_load > cap
+            or projected_energy > battery
+            or projected_time > MAX_ROUTE_MIN
+        )
+
+        if violates and v + 1 < num_vehicles:
+            finish_route()
+            v += 1
+            travel = _leg_time_min(prev, node, t, ctx)
+            leg_dist = float(D[prev, node])
+            leg_energy = leg_dist * base_energy
+            svc = float(service[node])
+
+        # Update state
+        load += demand[node]
+        energy += leg_energy
+        t += travel + svc
+        current.append(node)
+        prev = node
+
+    # finalize last route
+    finish_route()
+
+    # pad with empty routes if needed
+    while len(routes) < num_vehicles:
+        routes.append([])
+
+    # penalties for constraint overflows in each route
+    cap_penalty = 0.0
+    energy_penalty = 0.0
+    for r in routes:
+        if not r:
+            continue
+        load_total = sum(demand[n] for n in r)
+        if load_total > cap:
+            cap_penalty += (load_total - cap) * 1e5
+
+        # Distance-only battery model (same as OR-Tools energy dimension)
+        dist = D[depot, r[0]]
+        for i in range(len(r) - 1):
+            dist += D[r[i], r[i + 1]]
+        dist += D[r[-1], depot]
+        used_kwh = dist * base_energy
+        if used_kwh > battery:
+            energy_penalty += (used_kwh - battery) * 1e5
+
+    penalties += cap_penalty + energy_penalty
+    return routes[:num_vehicles], penalties
 
 
 # ============================================================
@@ -231,12 +348,12 @@ def mutate_route(seq):
 
 
 def crossover_plan(p1, p2):
-    assert len(p1) == len(p2), "Plans must have the same vehicle count"
-    return [ox_crossover(p1[v], p2[v]) for v in range(len(p1))]
+    assert len(p1) == len(p2), "Chromosomes must have equal length"
+    return ox_crossover(p1, p2)
 
 
 def mutate_plan(plan):
-    return [mutate_route(r) for r in plan]
+    return mutate_route(plan)
 
 
 def tournament_select(pop, fitness, k=3):
@@ -262,27 +379,31 @@ def ga_optimize_sequences(
     # Build context ONCE and reuse in evaluate
     ctx = _build_cost_context(data)
 
-    def evaluate(plan):
-        # Inline fast cost (avoid rebuilding ctx)
+    customers = [n for r in base_routes for n in r]
+
+    def evaluate(seq):
+        routes, penalties = _build_routes_from_sequence(seq, ctx)
         D = ctx["D"]
         depot = ctx["depot"]
 
         if objective == "distance":
             total = 0.0
-            for r in plan:
+            for r in routes:
                 if not r:
                     continue
                 total += D[depot, r[0]]
                 for i in range(len(r) - 1):
                     total += D[r[i], r[i + 1]]
                 total += D[r[-1], depot]
-            return float(total)
+            # Enforce workday with penalties (same as Tabu constraint)
+            total_time_pen = sum(route_time_penalty(r, ctx, depot=depot) for r in routes)
+            return float(total + penalties + total_time_pen)
 
         if objective == "energy":
             demand = ctx["demand"]
             total_E = 0.0
-            total_pen = 0.0
-            for r in plan:
+            total_pen = penalties
+            for r in routes:
                 if not r:
                     continue
                 total_E += route_energy_objective_pickup(r, D, demand, depot=depot)
@@ -291,15 +412,18 @@ def ga_optimize_sequences(
 
         raise ValueError("objective must be 'energy' or 'distance'")
 
-    # init population
-    population = [deepcopy(base_routes)]
+    # init population (permutation of all customers)
+    base_seq = customers[:]
+    population = [deepcopy(base_seq)]
     for _ in range(pop_size - 1):
-        population.append([mutate_route(r) for r in base_routes])
+        seq = base_seq[:]
+        random.shuffle(seq)
+        population.append(seq)
 
     fitness = [evaluate(p) for p in population]
 
     best_idx = min(range(pop_size), key=lambda i: fitness[i])
-    best_plan = deepcopy(population[best_idx])
+    best_seq = deepcopy(population[best_idx])
     best_fit = float(fitness[best_idx])
 
     for _ in range(generations):
@@ -318,9 +442,10 @@ def ga_optimize_sequences(
         g_best = min(range(pop_size), key=lambda i: fitness[i])
         if fitness[g_best] < best_fit:
             best_fit = float(fitness[g_best])
-            best_plan = deepcopy(population[g_best])
+            best_seq = deepcopy(population[g_best])
 
-    return best_plan, best_fit
+    best_routes, _ = _build_routes_from_sequence(best_seq, ctx)
+    return best_routes, best_fit
 
 
 # ============================================================

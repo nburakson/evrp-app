@@ -1880,8 +1880,8 @@ with opt_tab2:
     if data is None or routes is None:
         st.info("Önce OR-Tools sonucunu alın.")
     else:
-        st.info("💡 GA, OR-Tools rotalarındaki müşteri ziyaret sırasını optimize eder. "
-                "Farklı sıralama farklı enerji tüketimi demektir (yük birikimi nedeniyle).")
+        st.info("💡 GA, OR-Tools ile aynı kısıtlar ve amaç fonksiyonuyla yeni rotalar oluşturur. "
+                "Mesafe ve süre matrislerini kullanarak ziyaret sıralarını yeniden kurar.")
         
         col1, col2, col3, col4 = st.columns(4)
         with col1:
