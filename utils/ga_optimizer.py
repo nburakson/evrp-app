@@ -11,30 +11,41 @@ MAX_ROUTE_MIN = WORK_END_MIN - WORK_START_MIN  # 540
 
 
 # ============================================================
-# ⚡ ENERGY FORMULA — Pickup Type (same as OR-Tools)
-# Units: kWh (despite docstring in your older version)
+# ⚡ ENERGY FORMULA — Distance + Load model
+# Units: kWh (will be converted to % when displaying)
 # ============================================================
 def leg_energy_kwh(d_km: float, load_before: float) -> float:
     """
-    Energy model (kWh):
-      E = d_km * 0.436 + 0.002 * load_before
+    Energy model (kWh) - DISTANCE + LOAD:
+      E = 0.436 * d_km + 0.002 * load_before
 
-    NOTE: load_before here is in "desi" in your pipeline; keep consistent.
+    Returns energy consumption in kWh.
+    """
+    return 0.436 * float(d_km) + 0.002 * float(load_before)
+
+
+def _base_energy_per_km(data) -> float:
+    """
+    Base kWh/km used by OR-Tools energy dimension (distance-only model).
+    Falls back to legacy constant if not provided.
     """
 
-    #return float(d_km) * (0.436 + 0.002 * float(load_before))
-    return float(d_km) * 0.436 + 0.002 * float(load_before)
+    if "base_kwh_per_100km" in data:
+        return float(data["base_kwh_per_100km"]) / 100.0
+    return 0.436
 
 def route_energy_objective_pickup(route, D, demand, depot=0) -> float:
     """
-    Pickup model:
-      load starts at 0 and increases at each visit.
+    Distance + load energy model:
+      Energy = 0.436 * distance + 0.002 * load_before
+    
+    Returns total energy consumption in kWh.
     """
     if not route:
         return 0.0
 
-    load = 0.0
     E = 0.0
+    load = 0.0
 
     # depot -> first
     first = route[0]
@@ -50,7 +61,6 @@ def route_energy_objective_pickup(route, D, demand, depot=0) -> float:
     # last -> depot
     last = route[-1]
     E += leg_energy_kwh(D[last, depot], load)
-
     return E
 
 
@@ -65,6 +75,8 @@ def _build_cost_context(data):
     depot = int(data.get("depot", 0))
     demand = np.asarray(data["demand_desi"], dtype=float)
     service = np.asarray(data["service_min"], dtype=float)
+    vehicle_cap = float(data.get("vehicle_cap_desi", 0.0))
+    battery_cap = float(data.get("battery_capacity", 0.0))
 
     # Time matrices
     T_static = None
@@ -81,6 +93,10 @@ def _build_cost_context(data):
         "depot": depot,
         "demand": demand,
         "service": service,
+        "vehicle_cap": vehicle_cap,
+        "battery_cap": battery_cap,
+        "num_vehicles": int(data.get("num_vehicles", 0)),
+        "base_energy_per_km": _base_energy_per_km(data),
         "T_static": T_static,
         "T_by_hour": T_by_hour,
         "hours_sorted": hours_sorted,
@@ -144,6 +160,107 @@ def route_time_penalty(route, ctx, depot=0, penalty_per_min=1e5) -> float:
     total_t = route_total_time_min(route, ctx, depot)
     overflow = max(0.0, total_t - MAX_ROUTE_MIN)
     return float(overflow) * float(penalty_per_min)
+
+
+def _build_routes_from_sequence(sequence, ctx):
+    """
+    Convert a flat customer permutation into vehicle routes while enforcing
+    OR-Tools style constraints (capacity, battery, workday).
+
+    Returns (routes, penalties).
+    """
+    num_vehicles = ctx["num_vehicles"]
+    cap = ctx["vehicle_cap"]
+    battery = ctx["battery_cap"]
+    base_energy = ctx["base_energy_per_km"]
+    D = ctx["D"]
+    depot = ctx["depot"]
+    demand = ctx["demand"]
+    service = ctx["service"]
+
+    routes = []
+    penalties = 0.0
+
+    v = 0
+    current = []
+    load = 0.0
+    energy = 0.0
+    t = 0.0
+    prev = depot
+
+    def finish_route():
+        nonlocal current, load, energy, t, prev
+        routes.append(current)
+        current = []
+        load = 0.0
+        energy = 0.0
+        t = 0.0
+        prev = depot
+
+    for node in sequence:
+        # If we already exceeded vehicle count, keep adding to last vehicle but penalize heavily.
+        if v >= num_vehicles:
+            penalties += 1e6
+
+        travel = _leg_time_min(prev, node, t, ctx)
+        leg_dist = float(D[prev, node])
+        leg_energy = leg_dist * base_energy
+        svc = float(service[node])
+
+        # Predict constraints including return to depot
+        projected_load = load + demand[node]
+        projected_energy = energy + leg_energy + float(D[node, depot]) * base_energy
+        projected_time = t + travel + svc + _leg_time_min(node, depot, t + travel + svc, ctx)
+
+        violates = (
+            projected_load > cap
+            or projected_energy > battery
+            or projected_time > MAX_ROUTE_MIN
+        )
+
+        if violates and v + 1 < num_vehicles:
+            finish_route()
+            v += 1
+            travel = _leg_time_min(prev, node, t, ctx)
+            leg_dist = float(D[prev, node])
+            leg_energy = leg_dist * base_energy
+            svc = float(service[node])
+
+        # Update state
+        load += demand[node]
+        energy += leg_energy
+        t += travel + svc
+        current.append(node)
+        prev = node
+
+    # finalize last route
+    finish_route()
+
+    # pad with empty routes if needed
+    while len(routes) < num_vehicles:
+        routes.append([])
+
+    # penalties for constraint overflows in each route
+    cap_penalty = 0.0
+    energy_penalty = 0.0
+    for r in routes:
+        if not r:
+            continue
+        load_total = sum(demand[n] for n in r)
+        if load_total > cap:
+            cap_penalty += (load_total - cap) * 1e5
+
+        # Distance-only battery model (same as OR-Tools energy dimension)
+        dist = D[depot, r[0]]
+        for i in range(len(r) - 1):
+            dist += D[r[i], r[i + 1]]
+        dist += D[r[-1], depot]
+        used_kwh = dist * base_energy
+        if used_kwh > battery:
+            energy_penalty += (used_kwh - battery) * 1e5
+
+    penalties += cap_penalty + energy_penalty
+    return routes[:num_vehicles], penalties
 
 
 # ============================================================
@@ -231,18 +348,98 @@ def mutate_route(seq):
 
 
 def crossover_plan(p1, p2):
-    assert len(p1) == len(p2), "Plans must have the same vehicle count"
-    return [ox_crossover(p1[v], p2[v]) for v in range(len(p1))]
+    assert len(p1) == len(p2), "Chromosomes must have equal length"
+    return ox_crossover(p1, p2)
 
 
 def mutate_plan(plan):
-    return [mutate_route(r) for r in plan]
+    return mutate_route(plan)
 
 
 def tournament_select(pop, fitness, k=3):
     cand = random.sample(range(len(pop)), k)
     cand = min(cand, key=lambda i: fitness[i])
     return deepcopy(pop[cand])
+
+
+# ============================================================
+# 🔧 2-OPT LOCAL SEARCH
+# ============================================================
+def two_opt_improve_route(route, D, max_iterations=50):
+    """
+    Apply 2-opt local search to improve a single route.
+    Returns improved route.
+    """
+    if len(route) <= 2:
+        return route
+    
+    improved = True
+    iteration = 0
+    best_route = route[:]
+    
+    while improved and iteration < max_iterations:
+        improved = False
+        best_dist = 0.0
+        
+        # Calculate current distance
+        for i in range(len(best_route) - 1):
+            best_dist += D[best_route[i], best_route[i + 1]]
+        
+        for i in range(len(best_route) - 1):
+            for j in range(i + 2, len(best_route)):
+                # Try reversing segment [i+1:j+1]
+                new_route = best_route[:i+1] + best_route[i+1:j+1][::-1] + best_route[j+1:]
+                
+                # Calculate new distance
+                new_dist = 0.0
+                for k in range(len(new_route) - 1):
+                    new_dist += D[new_route[k], new_route[k + 1]]
+                
+                if new_dist < best_dist:
+                    best_route = new_route
+                    best_dist = new_dist
+                    improved = True
+                    break
+            
+            if improved:
+                break
+        
+        iteration += 1
+    
+    return best_route
+
+
+def apply_2opt_to_routes(routes, D, mode="full"):
+    """
+    Apply 2-opt to routes based on mode.
+    
+    mode: 
+        - "none": No 2-opt
+        - "selective": Apply to best 30% of routes
+        - "full": Apply to all routes
+    """
+    if mode == "none":
+        return routes
+    
+    improved_routes = []
+    
+    for route in routes:
+        if not route:
+            improved_routes.append(route)
+            continue
+        
+        if mode == "selective":
+            # Apply 2-opt with 30% probability
+            if random.random() < 0.3:
+                improved_route = two_opt_improve_route(route, D, max_iterations=20)
+            else:
+                improved_route = route
+        else:  # full
+            improved_route = two_opt_improve_route(route, D, max_iterations=50)
+        
+        improved_routes.append(improved_route)
+    
+    return improved_routes
 
 
 # ============================================================
@@ -255,34 +452,39 @@ def ga_optimize_sequences(
     generations=400,
     objective="energy",
     elitism=2,
-    seed=42
+    seed=42,
+    improvement_mode="none"
 ):
     random.seed(seed)
 
     # Build context ONCE and reuse in evaluate
     ctx = _build_cost_context(data)
 
-    def evaluate(plan):
-        # Inline fast cost (avoid rebuilding ctx)
+    customers = [n for r in base_routes for n in r]
+
+    def evaluate(seq):
+        routes, penalties = _build_routes_from_sequence(seq, ctx)
         D = ctx["D"]
         depot = ctx["depot"]
 
         if objective == "distance":
             total = 0.0
-            for r in plan:
+            for r in routes:
                 if not r:
                     continue
                 total += D[depot, r[0]]
                 for i in range(len(r) - 1):
                     total += D[r[i], r[i + 1]]
                 total += D[r[-1], depot]
-            return float(total)
+            # Enforce workday with penalties (same as Tabu constraint)
+            total_time_pen = sum(route_time_penalty(r, ctx, depot=depot) for r in routes)
+            return float(total + penalties + total_time_pen)
 
         if objective == "energy":
             demand = ctx["demand"]
             total_E = 0.0
-            total_pen = 0.0
-            for r in plan:
+            total_pen = penalties
+            for r in routes:
                 if not r:
                     continue
                 total_E += route_energy_objective_pickup(r, D, demand, depot=depot)
@@ -291,15 +493,18 @@ def ga_optimize_sequences(
 
         raise ValueError("objective must be 'energy' or 'distance'")
 
-    # init population
-    population = [deepcopy(base_routes)]
+    # init population (permutation of all customers)
+    base_seq = customers[:]
+    population = [deepcopy(base_seq)]
     for _ in range(pop_size - 1):
-        population.append([mutate_route(r) for r in base_routes])
+        seq = base_seq[:]
+        random.shuffle(seq)
+        population.append(seq)
 
     fitness = [evaluate(p) for p in population]
 
     best_idx = min(range(pop_size), key=lambda i: fitness[i])
-    best_plan = deepcopy(population[best_idx])
+    best_seq = deepcopy(population[best_idx])
     best_fit = float(fitness[best_idx])
 
     for _ in range(generations):
@@ -318,9 +523,18 @@ def ga_optimize_sequences(
         g_best = min(range(pop_size), key=lambda i: fitness[i])
         if fitness[g_best] < best_fit:
             best_fit = float(fitness[g_best])
-            best_plan = deepcopy(population[g_best])
+            best_seq = deepcopy(population[g_best])
 
-    return best_plan, best_fit
+    # Apply 2-opt improvement to final routes based on mode
+    best_routes, _ = _build_routes_from_sequence(best_seq, ctx)
+    if improvement_mode != "none":
+        best_routes = apply_2opt_to_routes(best_routes, ctx["D"], mode=improvement_mode)
+        # Recalculate fitness after 2-opt
+        # Rebuild sequence from improved routes
+        improved_seq = [n for r in best_routes for n in r]
+        best_fit = evaluate(improved_seq)
+    
+    return best_routes, best_fit
 
 
 # ============================================================
@@ -362,7 +576,7 @@ def print_ga_detailed_solution(data, routes, df_orders):
         f = route[0]
         d = float(D[depot, f])
         travel_t = _leg_time_min(depot, f, t_now, ctx)
-        E = leg_energy_kwh(d, load)
+        E = leg_energy_kwh(d, load)  # load is 0 before first customer
         svc = float(service[f])
 
         arr = t_now + travel_t
@@ -385,7 +599,7 @@ def print_ga_detailed_solution(data, routes, df_orders):
             a, b = route[i], route[i + 1]
             d = float(D[a, b])
             travel_t = _leg_time_min(a, b, t_now, ctx)
-            E = leg_energy_kwh(d, load)
+            E = leg_energy_kwh(d, load)  # load accumulates
             svc = float(service[b])
 
             arr = t_now + travel_t
@@ -407,7 +621,7 @@ def print_ga_detailed_solution(data, routes, df_orders):
         last = route[-1]
         d = float(D[last, depot])
         travel_t = _leg_time_min(last, depot, t_now, ctx)
-        E = leg_energy_kwh(d, load)
+        E = leg_energy_kwh(d, load)  # final leg carries full load
         arr = t_now + travel_t
 
         txt.append(
