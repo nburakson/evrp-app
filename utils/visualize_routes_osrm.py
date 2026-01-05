@@ -16,7 +16,8 @@ def visualize_routes_osrm(
     solution,
     time_dim,
     energy_dim,
-    osrm_client
+    osrm_client,
+    weekday=None
 ):
     """
     Visualize EVRP routes (OR-Tools or GA) using OSRM polylines.
@@ -41,16 +42,37 @@ def visualize_routes_osrm(
     T_by_hour = data.get("time_min_by_hour", None)
     loads = np.array(data["demand_desi"], dtype=float)
     depot = data["depot"]
-    # ✅ FIXED BATTERY READ (aligned with OR-Tools)
-    battery_capacity = float(
-       data.get("battery_capacity", data.get("battery_capacity", 100.0))
-    )
+    # Battery capacity in kWh
+    battery_capacity_kwh = float(data.get("battery_capacity", 100.0))  # Default 100 kWh
     # ============================================================
     # CREATE MAP
     # ============================================================
     center_lat = float(np.mean([depot_lat] + df_orders["Enlem"].tolist()))
     center_lon = float(np.mean([depot_lon] + df_orders["Boylam"].tolist()))
     m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="cartodbpositron")
+    
+    # Add weekday label if provided
+    if weekday is not None:
+        day_names = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+        day_name = day_names[weekday] if 0 <= weekday < 7 else "Bilinmeyen"
+        title_html = f'''
+        <div style="position: fixed; 
+                    top: 10px; 
+                    left: 50px; 
+                    width: 250px; 
+                    height: 50px; 
+                    background-color: white; 
+                    border:2px solid grey; 
+                    z-index:9999; 
+                    font-size:16px;
+                    padding: 10px;
+                    border-radius: 5px;
+                    box-shadow: 2px 2px 6px rgba(0,0,0,0.3);
+                    ">
+        <b>🗓️ Trafik Günü:</b> {day_name}
+        </div>
+        '''
+        m.get_root().html.add_child(folium.Element(title_html))
 
     # depot marker
     folium.Marker(
@@ -126,7 +148,7 @@ def visualize_routes_osrm(
         prev_node = depot
         t_now = 0.0
         cum_load = 0.0
-        remaining_batt = battery_capacity
+        remaining_batt = battery_capacity_kwh  # Start with full battery in kWh
 
         for node in route:
             row = df_orders.iloc[node - 1]
@@ -156,6 +178,9 @@ def visualize_routes_osrm(
                 service = float(row["Servis Süresi (dk)"])
                 dep = arr + service
                 travel_min = float(T_static[prev_node, node])
+                # Calculate traffic-aware time for tooltip
+                traffic_time = get_leg_time(prev_node, node, t_now)
+                t_now = arr + service  # Update for next iteration
 
             # -----------------------
             # UPDATE LOAD
@@ -163,15 +188,29 @@ def visualize_routes_osrm(
             cum_load += loads[node]
 
             # -----------------------
-            # ENERGY MODEL
+            # ENERGY MODEL (kWh, then convert to %)
+            # Formula: 0.436 * distance + 0.002 * load_before
             # -----------------------
-            empty_energy = 0.436 * d_km
-            load_energy = 0.002 * load_before_leg
-            total_energy = empty_energy + load_energy
+            energy_kwh = 0.436 * d_km + 0.002 * load_before_leg
+            energy_pct = (energy_kwh / battery_capacity_kwh) * 100.0  # Convert to percentage
 
-            batt_before = remaining_batt
-            remaining_batt -= total_energy
-            batt_after = remaining_batt
+            batt_before_pct = (remaining_batt / battery_capacity_kwh) * 100.0
+            remaining_batt -= energy_kwh  # Subtract kWh
+            batt_after_pct = (remaining_batt / battery_capacity_kwh) * 100.0
+            
+            # Calculate average speed (km/h)
+            avg_speed_kmh = (d_km / travel_min * 60) if travel_min > 0 else 0
+            
+            # Convert arrival and departure times to HH:MM format
+            arr_hours = int((arr + 540) // 60)  # +540 = 9:00 start
+            arr_mins = int((arr + 540) % 60)
+            dep_hours = int((dep + 540) // 60)
+            dep_mins = int((dep + 540) % 60)
+            arr_time_str = f"{arr_hours:02d}:{arr_mins:02d}"
+            dep_time_str = f"{dep_hours:02d}:{dep_mins:02d}"
+            
+            # Picked load at this node
+            picked_load = loads[node]
 
             # -----------------------
             # MARKER
@@ -181,15 +220,12 @@ def visualize_routes_osrm(
                 tooltip=(
                     f"<b>Order ID:</b> {row['OrderID']}<br>"
                     f"<b>Araç:</b> {original_v + 1}<br>"
-                    f"<b>Mesafe:</b> {d_km:.2f} km<br>"
-                    f"<b>Süre:</b> {travel_min:.1f} dk<br>"
-                    f"<b>LoadBefore:</b> {load_before_leg:.0f}<br>"
-                    f"<b>CumLoad:</b> {cum_load:.0f}<br>"
-                    f"<b>Enerji(Empty):</b> {empty_energy:.3f} kWh<br>"
-                    f"<b>Enerji(Load):</b> {load_energy:.3f} kWh<br>"
-                    f"<b>Enerji(Total):</b> {total_energy:.3f} kWh<br>"
-                    f"<b>BatteryBefore:</b> {batt_before/battery_capacity*100:.1f}%<br>"
-                    f"<b>BatteryAfter:</b> {batt_after/battery_capacity*100:.1f}%"
+                    f"<b>Varış Saati:</b> {arr_time_str}<br>"
+                    f"<b>Servis Süresi:</b> {service:.1f} dk<br>"
+                    f"<b>Çıkış Saati:</b> {dep_time_str}<br>"
+                    f"<b>Kalan Batarya:</b> {batt_after_pct:.1f}%<br>"
+                    f"<b>Alınan Yük:</b> {picked_load:.0f} desi<br>"
+                    f"<b>Toplam Yük:</b> {cum_load:.0f} desi"
                 ),
                 icon=BeautifyIcon(
                     number=str(row["OrderID"]),
@@ -205,6 +241,15 @@ def visualize_routes_osrm(
             # -----------------------
             # POLYLINE (OSRM) - Use vehicle color instead of energy color
             # -----------------------
+            # Get OSRM baseline time (without traffic)
+            osrm_time = float(T_static[prev_node, node])
+            
+            # Get traffic-aware time (uses T_by_hour if available)
+            if is_ga:
+                traffic_time_display = travel_min
+            else:
+                traffic_time_display = traffic_time
+            
             seg = osrm_client.route(coords[prev_node], coords[node])
             if seg:
                 folium.PolyLine(
@@ -213,12 +258,14 @@ def visualize_routes_osrm(
                     weight=6,
                     opacity=0.85,
                     tooltip=folium.Tooltip(
-                        f"<b>Araç {original_v + 1}</b><br>"
-                        f"{prev_node} → {node}<br>"
-                        f"Mesafe: {d_km:.2f} km<br>"
-                        f"LoadBefore: {load_before_leg:.0f}<br>"
-                        f"CumLoad: {cum_load:.0f}<br>"
-                        f"Enerji(Total): {total_energy:.3f} kWh"
+                        f"<b>Rota:</b> {prev_node} → {node}<br>"
+                        f"<b>Araç:</b> {original_v + 1}<br>"
+                        f"<b>Mesafe:</b> {d_km:.2f} km<br>"
+                        f"<b>Ort. Hız:</b> {avg_speed_kmh:.1f} km/h<br>"
+                        f"<b>OSRM Süre:</b> {osrm_time:.1f} dk<br>"
+                        f"<b>Trafikli Süre:</b> {traffic_time_display:.1f} dk<br>"
+                        f"<b>Taşınan Yük:</b> {cum_load:.0f} desi<br>"
+                        f"<b>Enerji:</b> {energy_kwh:.3f} kWh ({energy_pct:.1f}%)"
                     )
                 ).add_to(m)
 
@@ -229,11 +276,18 @@ def visualize_routes_osrm(
         # ========================================================
         load_before_leg = cum_load
         d_km = D[prev_node, depot]
-        travel_min = T_static[prev_node, depot]
+        osrm_time = float(T_static[prev_node, depot])
+        
+        # Calculate traffic-aware time for return leg
+        if is_ga:
+            traffic_time_return = get_leg_time(prev_node, depot, t_now)
+        else:
+            traffic_time_return = get_leg_time(prev_node, depot, t_now)
+        
+        avg_speed_kmh = (d_km / traffic_time_return * 60) if traffic_time_return > 0 else 0
 
-        empty_energy = 0.436 * d_km
-        load_energy = 0.002 * load_before_leg
-        total_energy = empty_energy + load_energy
+        energy_kwh = 0.436 * d_km + 0.002 * load_before_leg
+        energy_pct = (energy_kwh / battery_capacity_kwh) * 100.0
 
         seg = osrm_client.route(coords[prev_node], coords[depot])
         if seg:
@@ -243,11 +297,14 @@ def visualize_routes_osrm(
                 weight=6,
                 opacity=0.85,
                 tooltip=folium.Tooltip(
-                    f"<b>Araç {original_v + 1}</b><br>"
-                    f"{prev_node} → Depot<br>"
-                    f"Mesafe: {d_km:.2f} km<br>"
-                    f"LoadBefore: {load_before_leg:.0f}<br>"
-                    f"Enerji(Total): {total_energy:.3f} kWh"
+                    f"<b>Rota:</b> {prev_node} → Depot<br>"
+                    f"<b>Araç:</b> {original_v + 1}<br>"
+                    f"<b>Mesafe:</b> {d_km:.2f} km<br>"
+                    f"<b>Ort. Hız:</b> {avg_speed_kmh:.1f} km/h<br>"
+                    f"<b>OSRM Süre:</b> {osrm_time:.1f} dk<br>"
+                    f"<b>Trafikli Süre:</b> {traffic_time_return:.1f} dk<br>"
+                    f"<b>Taşınan Yük:</b> {cum_load:.0f} desi<br>"
+                    f"<b>Enerji:</b> {energy_kwh:.3f} kWh ({energy_pct:.1f}%)"
                 )
             ).add_to(m)
 

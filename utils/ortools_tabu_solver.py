@@ -210,9 +210,11 @@ def solve_with_ortools_tabu(data, time_limit_s: int = 10, seed: int = 42):
                 total_travel += leg_t
                 total_service += service_t
 
-                # Reporting formula (not used for constraints)
+                # Reporting formula: 0.436 * distance + 0.002 * load_before_leg (kWh)
+                # load_before_leg = cumulative load at PREVIOUS node (after pickup there)
+                # For pickup model: load accumulates as we visit customers
                 load_before_leg = solution.Value(capacity_dim.CumulVar(prev_idx))
-                en_used = leg_d * (0.436 + 0.002 * (load_before_leg / 1000.0))
+                en_used = 0.436 * leg_d + 0.002 * load_before_leg
                 total_energy += en_used
 
                 log(
@@ -237,7 +239,7 @@ def solve_with_ortools_tabu(data, time_limit_s: int = 10, seed: int = 42):
         avg_speed = (leg_d / (leg_t / 60.0)) if leg_t > 0 else 0.0
 
         load_before_leg = solution.Value(capacity_dim.CumulVar(prev_idx))
-        en_used = leg_d * (0.436 + 0.002 * (load_before_leg / 1000.0))
+        en_used = 0.436 * leg_d + 0.002 * load_before_leg
 
         total_dist += leg_d
         total_travel += leg_t

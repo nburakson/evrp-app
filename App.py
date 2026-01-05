@@ -1,5 +1,4 @@
 import os
-from dotenv import load_dotenv
 import streamlit as st
 import pandas as pd
 import requests
@@ -45,8 +44,18 @@ def df_to_orders(df_orders: pd.DataFrame):
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="Adres → Koordinat", layout="wide")
-st.title("📍 Adres → Koordinat Dönüştürücü (Structured + Hybrid Geocoder)")
+st.set_page_config(page_title="EVRP Optimizer", layout="wide", page_icon="🚚")
+
+# Apply custom styling
+from utils.ui_components import apply_custom_css, render_header, info_card, success_card, warning_card
+
+apply_custom_css()
+
+# Main header
+render_header(
+    "Electric Vehicle Routing Problem Optimizer",
+    "Elektrikli araç filosu için akıllı rota optimizasyonu"
+)
 
 # =========================================================
 # SESSION STATE
@@ -75,13 +84,14 @@ for key in ["evrp_problem", "ortools_data", "tabu_result",
 DEPOT_LAT = 40.900
 DEPOT_LON = 29.300
 BASE_DIR = Path(__file__).parent
-load_dotenv(BASE_DIR / ".env")
-OPENCAGE_API_KEY = os.getenv("OPENCAGE_API_KEY") or st.secrets.get("OPENCAGE_API_KEY")
+DATA_DIR = BASE_DIR / "Data"
+
+# Get API key from Streamlit secrets (primary) or fall back to .env
+OPENCAGE_API_KEY = st.secrets.get("OPENCAGE_API_KEY") or os.getenv("OPENCAGE_API_KEY")
 
 if not OPENCAGE_API_KEY:
-    st.error("OPENCAGE_API_KEY not found. Set it as an environment variable or in Streamlit secrets.")
+    st.error("🔑 OPENCAGE_API_KEY not found. Please add it to Streamlit secrets (.streamlit/secrets.toml).")
     st.stop()
-DATA_DIR = BASE_DIR / "Data"
 
 # =========================================================
 # LOAD TRAFFIC DATA (CONSTANT, ALWAYS LOADED)
@@ -1247,6 +1257,7 @@ with evrp_tab1:
             )
 
         st.session_state["T_by_hour"] = T_by_hour
+        st.session_state["selected_weekday"] = weekday
         st.success(f"{selected_day} için trafik matrisleri hazır.")
 
 # ================= EVRP MODEL OLUŞTUR ======================
@@ -1478,6 +1489,9 @@ with evrp_tab2:
             st.info("🔄 Çoklu Tur Modu: Araçlar depoya dönüp batarya doldurduktan sonra yeni rota yapabilir.")
 
         if st.button("🚀 Çöz"):
+            import time
+            start_time = time.time()
+            
             if allow_multitrip:
                 # Use multi-trip solver
                 from utils.multitrip_solver import solve_multitrip_ortools
@@ -1497,6 +1511,8 @@ with evrp_tab2:
                         time_limit_s=int(time_limit),
                         seed=int(seed),
                     )
+            
+            ortools_time = time.time() - start_time
 
             st.session_state["tabu_result"] = result
             st.session_state["solver_mode"] = solver_mode
@@ -1531,7 +1547,7 @@ with evrp_tab2:
                     total_trips = sum(len(vehicle_trips) for vehicle_trips in trips)
                     total_customers = sum(len(route) for route in routes)
                     
-                    st.success(f"✅ Çözüm bulundu! {n_vehicles} araç ile {total_trips} tur yapıldı, {total_customers} müşteri servis edildi.")
+                    st.success(f"✅ Çözüm bulundu! {n_vehicles} araç ile {total_trips} tur yapıldı, {total_customers} müşteri servis edildi. (⏱️ {ortools_time:.1f} saniye)")
                     
                     # Display trip summary
                     st.markdown("### 🔄 Tur Özeti")
@@ -1549,7 +1565,7 @@ with evrp_tab2:
                             st.write(f"**Araç {v+1}:** 1 tur - {stats['num_customers']} müşteri, "
                                     f"{stats['distance_km']:.1f} km")
                 else:
-                    st.success("✅ Çözüm bulundu!")
+                    st.success(f"✅ Çözüm bulundu! (⏱️ {ortools_time:.1f} saniye)")
                     
                 st.text("✅ Rotalar cache'lendi (GA için hazır).")
             else:
@@ -1685,6 +1701,9 @@ with evrp_tab3:
                 
                 filtered_routing = FilteredSolution(routing, manager, solution, selected_vehicles, all_routes)
                 
+                # Get weekday from session state if available
+                selected_weekday = st.session_state.get("selected_weekday")
+                
                 with st.spinner("Harita oluşturuluyor..."):
                     m = visualize_routes_osrm(
                         depot_lat=DEPOT_LAT,
@@ -1697,6 +1716,7 @@ with evrp_tab3:
                         time_dim=time_dim,
                         energy_dim=energy_dim,
                         osrm_client=osrm_client,
+                        weekday=selected_weekday,
                     )
 
                 st_folium(m, width=1200, height=800)
@@ -1737,16 +1757,14 @@ with evrp_tab3:
                         total_km += d_km
                         total_time += t_min
                         
-                        # Load before this leg
+                        # Load before this leg (before picking up at current node)
                         load_before_leg = cum_load
                         
-                        # Energy calculation (matching visualize_routes_osrm)
-                        empty_energy = 0.436 * d_km
-                        load_energy = 0.002 * load_before_leg
-                        leg_energy = empty_energy + load_energy
-                        total_energy += leg_energy
+                        # Energy calculation (kWh): 0.436 * distance + 0.002 * load_before
+                        energy_kwh = 0.436 * d_km + 0.002 * load_before_leg
+                        total_energy += energy_kwh
                         
-                        # Update cumulative load
+                        # Update cumulative load (pick up at this node)
                         cum_load += loads[node]
                         total_load += loads[node]
                         
@@ -1763,14 +1781,13 @@ with evrp_tab3:
                     total_km += d_km
                     total_time += t_min
                     
-                    # Energy for return trip
-                    empty_energy = 0.436 * d_km
-                    load_energy = 0.002 * cum_load
-                    leg_energy = empty_energy + load_energy
-                    total_energy += leg_energy
+                    # Energy for return trip (kWh)
+                    energy_kwh = 0.436 * d_km + 0.002 * cum_load
+                    total_energy += energy_kwh
                     
-                    # Calculate remaining energy and capacity
-                    remaining_energy_tabu = battery_capacity - total_energy
+                    # Calculate remaining battery as percentage
+                    energy_pct_of_battery = (total_energy / battery_capacity) * 100.0
+                    remaining_energy_pct = 100.0 - energy_pct_of_battery
                     remaining_capacity = vehicle_capacity - total_load
                     
                     vehicle_stats.append({
@@ -1779,8 +1796,9 @@ with evrp_tab3:
                         "Toplam Süre (dk)": f"{total_time:.1f}",
                         "Taşınan Yük (desi)": f"{total_load:.0f}",
                         "Boş Kapasite (desi)": f"{remaining_capacity:.0f}",
-                        "Tüketilen Enerji (kWh)": f"{total_energy:.2f}",
-                        "Kalan Enerji % - Tabu": f"{(remaining_energy_tabu/battery_capacity*100):.1f}%",
+                        "Enerji (kWh)": f"{total_energy:.3f}",
+                        "Enerji (%)": f"{energy_pct_of_battery:.1f}",
+                        "Kalan (%)": f"{remaining_energy_pct:.1f}",
                     })
                 
                 # Display as DataFrame
@@ -1795,7 +1813,8 @@ with evrp_tab3:
                     total_km_all = sum(float(s["Toplam KM"]) for s in vehicle_stats)
                     total_time_all = sum(float(s["Toplam Süre (dk)"]) for s in vehicle_stats)
                     total_load_all = sum(float(s["Taşınan Yük (desi)"]) for s in vehicle_stats)
-                    total_energy_all = sum(float(s["Tüketilen Enerji (kWh)"]) for s in vehicle_stats)
+                    total_energy_kwh = sum(float(s["Enerji (kWh)"]) for s in vehicle_stats)
+                    total_energy_pct = sum(float(s["Enerji (%)"]) for s in vehicle_stats)
                     
                     with col1:
                         st.metric("Toplam Mesafe", f"{total_km_all:.2f} km")
@@ -1804,7 +1823,7 @@ with evrp_tab3:
                     with col3:
                         st.metric("Toplam Yük", f"{total_load_all:.0f} desi")
                     with col4:
-                        st.metric("Toplam Enerji", f"{total_energy_all:.2f} kWh")
+                        st.metric("Toplam Enerji", f"{total_energy_kwh:.2f} kWh ({total_energy_pct:.1f}%)")
                 else:
                     st.info("Seçili araçlar için istatistik hesaplanamadı.")
 
@@ -1820,11 +1839,19 @@ from utils.ga_optimizer import (
     print_ga_detailed_solution,
     total_plan_cost,
 )
+from utils.shift_reallocation import (
+    analyze_early_finishers,
+    calculate_route_metrics,
+    calculate_solution_metrics,
+    two_phase_reallocation,
+    clarke_wright_savings,
+    apply_shift_reallocation,
+)
 
 opt_tab1, opt_tab2, opt_tab3, opt_tab4 = st.tabs(
     [
-        "🚚 OR-Tools Rotaları",
-        "🧬 Genetik Algoritma Çözümü",
+        "🚚 OR-Tools Rotaları (Tabu)",
+        "🧬 GA Çözücü (Bağımsız)",
         "🗺 GA Çözüm Haritası",
         "⚡ Enerji Karşılaştırması",
     ]
@@ -1833,13 +1860,16 @@ opt_tab1, opt_tab2, opt_tab3, opt_tab4 = st.tabs(
 # ---------- OPT TAB 1: SHOW OR-TOOLS ROUTES (DETAILED) ----------
 with opt_tab1:
     st.subheader("🚚 OR-Tools Rota Özeti (Detaylı Çıktı)")
+    
+    st.info("ℹ️ Bu sekme sadece OR-Tools Tabu Search sonuçlarını gösterir. "
+            "**GA çalıştırmak için '🧬 Genetik Algoritma Çözümü' sekmesine gidin.**")
 
     data = st.session_state.get("ortools_data")
     df_orders = st.session_state.get("orders_df")
     tabu_result = st.session_state.get("tabu_result")
 
     if tabu_result is None or df_orders is None or data is None:
-        st.info("Henüz OR-Tools çözümü yok. Önce Tabu Search çalıştırın.")
+        st.warning("Henüz OR-Tools çözümü yok. Önce 'OR-Tools Çözücü' sekmesinden Tabu Search çalıştırın.")
     else:
         routing = tabu_result["routing"]
         manager = tabu_result["manager"]
@@ -1871,17 +1901,24 @@ with opt_tab1:
 
 # ---------- OPT TAB 2: RUN GA + PRINT FULL TABLE ----------
 with opt_tab2:
-    st.subheader("🧬 Genetik Algoritma ile Rota Sıralamalarını İyileştir")
+    st.subheader("🧬 Genetik Algoritma - Bağımsız VRP Çözücü")
 
     data = st.session_state.get("ortools_data")
-    routes = st.session_state.get("ortools_routes")
+    ortools_routes = st.session_state.get("ortools_routes")
     df_orders = st.session_state.get("orders_df")
 
-    if data is None or routes is None:
-        st.info("Önce OR-Tools sonucunu alın.")
+    if data is None or df_orders is None:
+        st.info("Önce siparişleri ve OSRM matrislerini oluşturun (Tab 4).")
     else:
-        st.info("💡 GA, OR-Tools rotalarındaki müşteri ziyaret sırasını optimize eder. "
-                "Farklı sıralama farklı enerji tüketimi demektir (yük birikimi nedeniyle).")
+        # Choose starting point
+        use_ortools_init = st.checkbox(
+            "OR-Tools sonucundan başla (varsa)",
+            value=True if ortools_routes is not None else False,
+            help="İşaretliyse OR-Tools rotalarını kullanır, değilse sıfırdan başlar"
+        )
+        
+        st.info("💡 GA, OR-Tools ile **aynı kısıtlar ve amaç fonksiyonuyla** çalışır: "
+                "mesafe-based enerji (0.436 kWh/km), kapasite, batarya ve çalışma saati kısıtları.")
         
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -1920,82 +1957,87 @@ with opt_tab2:
                 help="Farklı seed = farklı sonuçlar"
             )
 
-        objective = st.selectbox(
-            "Amaç fonksiyonu", 
-            ["energy", "distance"], 
-            index=0,
-            help="Energy: Yük birikimini dikkate alır (önerilen)"
-        )
+        col_obj, col_imp = st.columns(2)
+        with col_obj:
+            objective = st.selectbox(
+                "Amaç fonksiyonu", 
+                ["energy", "distance"], 
+                index=0,
+                help="Energy: Mesafe-based enerji modeli (OR-Tools ile aynı)"
+            )
+        with col_imp:
+            improvement_mode = st.selectbox(
+                "İyileştirme modu",
+                ["none", "selective", "full"],
+                format_func=lambda x: {
+                    "none": "Hızlı (Sadece GA)",
+                    "selective": "Dengeli (Seçici 2-opt)",
+                    "full": "Maksimum Kalite (Full 2-opt)"
+                }[x],
+                index=0,
+                help="2-opt lokal arama ile çözümü iyileştir (daha yavaş ama daha iyi)"
+            )
 
         if st.button("🧬 GA Çalıştır"):
-            # Show original routes summary
-            st.markdown("### 📊 Başlangıç Rotaları (OR-Tools)")
+            # Determine starting routes
+            if use_ortools_init and ortools_routes is not None:
+                st.markdown("### 📊 Başlangıç: OR-Tools Rotaları")
+                base_routes = ortools_routes
+            else:
+                st.markdown("### 📊 Başlangıç: Sıfırdan (Tüm Müşteriler)")
+                # Create dummy base routes with all customers in one list
+                # GA will redistribute them across vehicles
+                num_customers = len(df_orders)
+                all_customers = list(range(1, num_customers + 1))  # node IDs start from 1
+                base_routes = [all_customers]  # All customers in one "route"
             
-            # Calculate detailed energy for OR-Tools routes
+            # Calculate detailed energy metrics
             D_matrix = np.array(data["distance_km"], dtype=float)
             demands = np.array(data["demand_desi"], dtype=float)
             depot = data["depot"]
             
-            st.write("**OR-Tools Rotaları (Sadece Mesafe Bazlı Enerji):**")
-            ortools_total_energy_simple = 0.0
-            ortools_total_energy_load = 0.0
+            st.write("**Başlangıç Rotaları:**")
+            total_energy_distance_only = 0.0
             
-            for v, route in enumerate(routes):
+            for v, route in enumerate(base_routes):
                 if route:
-                    # Simple energy (distance only - like Tabu uses)
-                    energy_simple = 0.0
+                    # Distance-only energy (matching OR-Tools constraint)
+                    energy_dist = 0.0
                     prev = depot
                     for node in route:
-                        energy_simple += D_matrix[prev, node] * 0.436
+                        energy_dist += D_matrix[prev, node] * 0.436
                         prev = node
-                    energy_simple += D_matrix[prev, depot] * 0.436
+                    energy_dist += D_matrix[prev, depot] * 0.436
                     
-                    # Load-dependent energy (like GA should use)
-                    energy_load = 0.0
-                    cum_load = 0.0
-                    prev = depot
-                    for node in route:
-                        d_km = D_matrix[prev, node]
-                        energy_load += d_km * 0.436 + 0.002 * cum_load
-                        cum_load += demands[node]
-                        prev = node
-                    # Return to depot
-                    energy_load += D_matrix[prev, depot] * 0.436 + 0.002 * cum_load
+                    total_energy_distance_only += energy_dist
                     
-                    ortools_total_energy_simple += energy_simple
-                    ortools_total_energy_load += energy_load
-                    
-                    st.write(f"Araç {v+1}: {len(route)} müşteri - {route[:5]}{'...' if len(route) > 5 else ''}")
-                    st.write(f"  → Enerji (sadece mesafe): {energy_simple:.3f} kWh")
-                    st.write(f"  → Enerji (yük dahil): {energy_load:.3f} kWh")
-                    st.write(f"  → **Fark: {(energy_load - energy_simple):.3f} kWh** ({((energy_load - energy_simple)/energy_simple*100):.1f}%)")
+                    st.write(f"Rota {v+1}: {len(route)} müşteri")
+                    st.write(f"  → Enerji (mesafe-based): {energy_dist:.3f} kWh")
             
             st.markdown("---")
-            st.write(f"**Toplam Enerji (sadece mesafe):** {ortools_total_energy_simple:.3f} kWh")
-            st.write(f"**Toplam Enerji (yük dahil):** {ortools_total_energy_load:.3f} kWh")
-            st.write(f"**Toplam Fark:** {(ortools_total_energy_load - ortools_total_energy_simple):.3f} kWh ({((ortools_total_energy_load - ortools_total_energy_simple)/ortools_total_energy_simple*100):.1f}%)")
+            st.write(f"**Toplam Enerji (mesafe-based, OR-Tools modeli):** {total_energy_distance_only:.3f} kWh")
             
-            original_cost = total_plan_cost(data, routes, objective)
-            st.write(f"**GA'nın optimize edeceği maliyet ({objective}):** {original_cost:.4f}")
+            original_cost = total_plan_cost(data, base_routes, objective)
+            st.write(f"**Başlangıç Maliyeti ({objective}):** {original_cost:.4f}")
             
             st.markdown("---")
-            
-            # Debug output before GA
-            st.write("**🔬 Debug: OR-Tools İlk 3 Rota:**")
-            for v in range(min(3, len(routes))):
-                if routes[v]:
-                    st.write(f"Araç {v+1}: {routes[v][:5]}{'...' if len(routes[v]) > 5 else ''}")
             
             with st.spinner(f"Genetik Algoritma çalışıyor ({generations} generasyon)..."):
+                import time
+                start_time = time.time()
+                
                 best_routes, best_fit = ga_optimize_sequences(
                     data=data,
-                    base_routes=routes,
+                    base_routes=base_routes,
                     pop_size=int(pop_size),
                     generations=int(generations),
                     objective=objective,
                     elitism=2,
                     seed=int(ga_seed),
+                    improvement_mode=improvement_mode
                 )
+                
+                ga_time = time.time() - start_time
             
             # Debug output after GA
             st.write("**🔬 Debug: GA Sonrası İlk 3 Rota:**")
@@ -2015,10 +2057,11 @@ with opt_tab2:
             
             # Check if routes actually changed
             routes_changed = False
-            for v in range(len(routes)):
-                if routes[v] != best_routes[v]:
-                    routes_changed = True
-                    break
+            for v in range(min(len(base_routes), len(best_routes))):
+                if v < len(base_routes) and v < len(best_routes):
+                    if base_routes[v] != best_routes[v]:
+                        routes_changed = True
+                        break
 
             st.markdown("---")
             st.markdown("### ✅ GA Sonuçları")
@@ -2044,9 +2087,9 @@ with opt_tab2:
                     st.warning("⚠️ Rotalar değişmedi")
             
             if improvement > 0.002:
-                st.success(f"🎉 GA ile **{improvement:.2f}%** iyileşme sağlandı!")
+                st.success(f"🎉 GA ile **{improvement:.2f}%** iyileşme sağlandı! (⏱️ {ga_time:.1f} saniye)")
             elif improvement > 0:
-                st.info(f"✅ GA ile **{improvement:.2f}%** küçük iyileşme sağlandı.")
+                st.info(f"✅ GA ile **{improvement:.2f}%** küçük iyileşme sağlandı. (⏱️ {ga_time:.1f} saniye)")
             else:
                 st.warning(
                     "⚠️ GA iyileştirme bulamadı. Şunları deneyin:\n"
@@ -2054,16 +2097,16 @@ with opt_tab2:
                     "- Generasyon sayısını artırın (1000+)\n"
                     "- Farklı random seed deneyin\n"
                     "- Mutasyon oranını artırın\n"
-                    "- OR-Tools rotaları zaten optimal olabilir!"
+                    "- Başlangıç çözümü zaten optimal olabilir!"
                 )
             
             # Show which routes changed
             if routes_changed:
                 st.markdown("### 🔄 Değişen Rotalar")
-                for v in range(len(routes)):
-                    if routes[v] != best_routes[v]:
+                for v in range(len(base_routes)):
+                    if base_routes[v] != best_routes[v]:
                         st.write(f"**Araç {v+1}:**")
-                        st.write(f"  Önce: {routes[v][:10]}{'...' if len(routes[v]) > 10 else ''}")
+                        st.write(f"  Önce: {base_routes[v][:10]}{'...' if len(base_routes[v]) > 10 else ''}")
                         st.write(f"  Sonra: {best_routes[v][:10]}{'...' if len(best_routes[v]) > 10 else ''}")
 
             txt_ga = print_ga_detailed_solution(
@@ -2165,6 +2208,9 @@ with opt_tab3:
                         filtered_data = data.copy()
                         filtered_data["num_vehicles"] = len(valid_selected)
                     
+                    # Get weekday from session state if available
+                    selected_weekday = st.session_state.get("selected_weekday")
+                    
                     m_ga = visualize_routes_osrm(
                         depot_lat=DEPOT_LAT,
                         depot_lon=DEPOT_LON,
@@ -2176,6 +2222,7 @@ with opt_tab3:
                         time_dim=None,
                         energy_dim=None,
                         osrm_client=osrm_client,
+                        weekday=selected_weekday,
                     )
 
                 st_folium(m_ga, width=1200, height=800)
@@ -2224,16 +2271,16 @@ with opt_tab3:
                         total_km += d_km
                         total_time += t_min
                         
-                        # Pick up load at this node
-                        node_load = float(loads[node])
-                        cum_load += node_load
-                        total_load += node_load
+                        # Load before this leg (before picking up at current node)
+                        load_before_leg = cum_load
                         
-                        # Energy consumption for this leg
-                        empty_energy = 0.436 * d_km
-                        load_energy = 0.002 * cum_load
-                        leg_energy = empty_energy + load_energy
-                        total_energy += leg_energy
+                        # Energy calculation (kWh): 0.436 * distance + 0.002 * load_before
+                        energy_kwh = 0.436 * d_km + 0.002 * load_before_leg
+                        total_energy += energy_kwh
+                        
+                        # Update cumulative load (pick up at this node)
+                        cum_load += loads[node]
+                        total_load += loads[node]
                         
                         prev_node = node
                     
@@ -2243,14 +2290,13 @@ with opt_tab3:
                     total_km += d_km
                     total_time += t_min
                     
-                    # Energy for return trip
-                    empty_energy = 0.436 * d_km
-                    load_energy = 0.002 * cum_load
-                    leg_energy = empty_energy + load_energy
-                    total_energy += leg_energy
+                    # Energy for return trip (kWh)
+                    energy_kwh = 0.436 * d_km + 0.002 * cum_load
+                    total_energy += energy_kwh
                     
-                    # Calculate remaining energy and capacity
-                    remaining_energy_ga = battery_capacity - total_energy
+                    # Calculate remaining battery as percentage
+                    energy_pct_of_battery = (total_energy / battery_capacity) * 100.0
+                    remaining_energy_pct = 100.0 - energy_pct_of_battery
                     remaining_capacity = vehicle_capacity - total_load
                     
                     vehicle_stats.append({
@@ -2259,8 +2305,9 @@ with opt_tab3:
                         "Toplam Süre (dk)": f"{total_time:.1f}",
                         "Taşınan Yük (desi)": f"{total_load:.0f}",
                         "Boş Kapasite (desi)": f"{remaining_capacity:.0f}",
-                        "Tüketilen Enerji (kWh)": f"{total_energy:.2f}",
-                        "Kalan Enerji % - GA": f"{(remaining_energy_ga/battery_capacity*100):.1f}%",
+                        "Enerji (kWh)": f"{total_energy:.3f}",
+                        "Enerji (%)": f"{energy_pct_of_battery:.1f}",
+                        "Kalan (%)": f"{remaining_energy_pct:.1f}",
                     })
                 
                 # Display as DataFrame
@@ -2275,7 +2322,8 @@ with opt_tab3:
                     total_km_all = sum(float(s["Toplam KM"]) for s in vehicle_stats)
                     total_time_all = sum(float(s["Toplam Süre (dk)"]) for s in vehicle_stats)
                     total_load_all = sum(float(s["Taşınan Yük (desi)"]) for s in vehicle_stats)
-                    total_energy_all = sum(float(s["Tüketilen Enerji (kWh)"]) for s in vehicle_stats)
+                    total_energy_kwh = sum(float(s["Enerji (kWh)"]) for s in vehicle_stats)
+                    total_energy_pct = sum(float(s["Enerji (%)"]) for s in vehicle_stats)
                     
                     with col1:
                         st.metric("Toplam Mesafe", f"{total_km_all:.2f} km")
@@ -2284,7 +2332,7 @@ with opt_tab3:
                     with col3:
                         st.metric("Toplam Yük", f"{total_load_all:.0f} desi")
                     with col4:
-                        st.metric("Toplam Enerji", f"{total_energy_all:.2f} kWh")
+                        st.metric("Toplam Enerji", f"{total_energy_kwh:.2f} kWh ({total_energy_pct:.1f}%)")
                 else:
                     st.info("Seçili araçlar için istatistik hesaplanamadı.")
 
@@ -2391,13 +2439,14 @@ with opt_tab4:
                     tabu_km += d_km
                     tabu_time += t_min
                     
+                    # Energy in kWh (use load BEFORE picking up at this node)
+                    energy_kwh = 0.436 * d_km + 0.002 * cum_load
+                    tabu_energy += energy_kwh
+                    
+                    # NOW add the load picked up at this node
                     node_load = float(loads[node])
                     cum_load += node_load
                     tabu_load += node_load
-                    
-                    empty_energy = 0.436 * d_km
-                    load_energy = 0.002 * cum_load
-                    tabu_energy += empty_energy + load_energy
                     
                     prev_node = node
                 
@@ -2429,13 +2478,14 @@ with opt_tab4:
                     ga_km += d_km
                     ga_time += t_min
                     
+                    # Energy in kWh (use load BEFORE picking up at this node)
+                    energy_kwh = 0.436 * d_km + 0.002 * cum_load
+                    ga_energy += energy_kwh
+                    
+                    # NOW add the load picked up at this node
                     node_load = float(loads[node])
                     cum_load += node_load
                     ga_load += node_load
-                    
-                    empty_energy = 0.436 * d_km
-                    load_energy = 0.002 * cum_load
-                    ga_energy += empty_energy + load_energy
                     
                     prev_node = node
                 
@@ -2456,8 +2506,8 @@ with opt_tab4:
                 "Tabu KM": f"{tabu_km:.2f}",
                 "GA KM": f"{ga_km:.2f}",
                 "KM İyileşme %": f"{km_improvement:.1f}%",
-                "Tabu Enerji (kWh)": f"{tabu_energy:.2f}",
-                "GA Enerji (kWh)": f"{ga_energy:.2f}",
+                "Tabu Enerji (kWh)": f"{tabu_energy:.3f}",
+                "GA Enerji (kWh)": f"{ga_energy:.3f}",
                 "Enerji İyileşme %": f"{energy_improvement:.1f}%",
                 "Tabu Süre (dk)": f"{tabu_time:.1f}",
                 "GA Süre (dk)": f"{ga_time:.1f}",
@@ -2514,13 +2564,15 @@ with opt_tab4:
             st.caption(f"Tabu: {total_tabu_km:.2f} km")
         
         with col2:
+            energy_pct_tabu = (total_tabu_energy / battery_capacity) * 100.0
+            energy_pct_ga = (total_ga_energy / battery_capacity) * 100.0
             st.metric(
                 "Toplam Enerji",
-                f"{total_ga_energy:.2f} kWh",
+                f"{total_ga_energy:.2f} kWh ({energy_pct_ga:.1f}%)",
                 f"{energy_total_improvement:.1f}% iyileşme" if energy_total_improvement > 0 else f"{energy_total_improvement:.1f}%",
                 delta_color="normal" if energy_total_improvement > 0 else "inverse"
             )
-            st.caption(f"Tabu: {total_tabu_energy:.2f} kWh")
+            st.caption(f"Tabu: {total_tabu_energy:.2f} kWh ({energy_pct_tabu:.1f}%)")
         
         with col3:
             st.metric(
@@ -2537,3 +2589,403 @@ with opt_tab4:
                 "0%"
             )
             st.caption("Değişmez")
+
+
+# =========================================================
+# 🔄 ÇİFT VARDİYA OPTİMİZASYONU (AYRI BÖLÜM)
+# =========================================================
+st.markdown("---")
+st.header("🔄 Çift Vardiya Optimizasyonu")
+
+st.markdown("""
+### 💡 Konsept: İki Vardiya Sistemi
+
+**Strateji:**
+- 🌅 **Sabah Vardiyası (09:00-12:00)**: Bazı araçlar erken döner
+- 🔌 **Öğle Molası (12:00-13:00)**: Batarya şarjı + yük boşaltma
+- 🌇 **Öğleden Sonra Vardiyası (13:00-18:00)**: Aynı araçlar tekrar kullanılır
+
+**Potansiyel Faydalar:**
+- ✅ Daha az araç kullanımı (maliyet tasarrufu)
+- ✅ Daha iyi araç kullanım oranı
+- ✅ Toplam enerji optimizasyonu
+""")
+
+data = st.session_state.get("ortools_data")
+ortools_routes = st.session_state.get("ortools_routes")
+ga_routes = st.session_state.get("ga_best_routes")
+df_orders = st.session_state.get("orders_df")
+
+if data is None or df_orders is None:
+    st.warning("Önce EVRP modelini oluşturun ve bir çözüm alın (OR-Tools veya GA).")
+else:
+    # Solution selector
+    st.markdown("---")
+    st.subheader("📋 Çözüm Seçimi")
+    
+    col_sel1, col_sel2 = st.columns([2, 3])
+    
+    with col_sel1:
+        solution_options = []
+        if ortools_routes is not None:
+            solution_options.append("OR-Tools (Tabu Search)")
+        if ga_routes is not None:
+            solution_options.append("GA (Genetik Algoritma)")
+        
+        if not solution_options:
+            st.error("❌ Henüz bir çözüm yok. Önce OR-Tools veya GA çalıştırın.")
+            st.stop()
+        
+        selected_solution = st.selectbox(
+            "Hangi çözümü analiz etmek istersiniz?",
+            solution_options,
+            help="Çift vardiya analizi için kullanılacak rota çözümü"
+        )
+    
+    with col_sel2:
+        if selected_solution == "OR-Tools (Tabu Search)":
+            st.info("🚚 **OR-Tools Tabu Search** çözümü seçildi")
+            selected_routes = ortools_routes
+        else:
+            st.info("🧬 **Genetik Algoritma** çözümü seçildi")
+            selected_routes = ga_routes
+    
+    st.markdown("---")
+    st.subheader("📊 Mevcut Çözüm Analizi")
+    
+    # Analyze current solution
+    analysis = analyze_early_finishers(selected_routes, data, cutoff_time=12*60)
+    
+    col_a1, col_a2, col_a3 = st.columns(3)
+    
+    with col_a1:
+        st.metric(
+            "Toplam Araç",
+            len(selected_routes),
+            help="Şu anda kullanılan toplam araç sayısı"
+        )
+    
+    with col_a2:
+        st.metric(
+            "Erken Dönen Araçlar",
+            analysis["num_early"],
+            help="12:00'den önce depoya dönen araçlar"
+        )
+    
+    with col_a3:
+        st.metric(
+            "Geç Dönen Araçlar",
+            analysis["num_late"],
+            help="12:00'den sonra dönen araçlar"
+        )
+    
+    # Show detailed vehicle stats
+    st.markdown("### 🚚 Araç Detayları")
+    
+    vehicle_detail_data = []
+    for stats in analysis["vehicle_stats"]:
+        is_early = stats["vehicle_id"] in analysis["early_vehicles"]
+        vehicle_detail_data.append({
+            "Araç": f"Araç {stats['vehicle_id'] + 1}",
+            "Müşteri Sayısı": stats["num_customers"],
+            "Dönüş Saati": f"{int(stats['return_hour'])}:{int((stats['return_hour'] % 1) * 60):02d}",
+            "Durum": "✅ Erken (Öğleden sonra kullanılabilir)" if is_early else "⏳ Geç (Sadece sabah)",
+            "Rota": str(stats["route"][:5]) + "..." if len(stats["route"]) > 5 else str(stats["route"])
+        })
+    
+    detail_df = pd.DataFrame(vehicle_detail_data)
+    st.dataframe(detail_df, use_container_width=True)
+    
+    if analysis["num_early"] == 0:
+        st.error("❌ Hiç araç 12:00'den önce dönmüyor. Çift vardiya optimizasyonu uygulanamaz.")
+        st.info("💡 Öneriler:\n"
+                "- Araç sayısını artırın\n"
+                "- Daha kısa rotalar oluşturun\n"
+                "- Sabah kesme saatini (cutoff time) 13:00 veya 14:00'e taşıyın")
+    else:
+        st.success(f"✅ {analysis['num_early']} araç öğleden sonra tekrar kullanılabilir!")
+        
+        st.markdown("---")
+        st.subheader("🔧 Yeniden Atama Parametreleri")
+        
+        col_p1, col_p2, col_p3 = st.columns(3)
+        
+        with col_p1:
+            morning_cutoff = st.slider(
+                "Sabah Kesme Saati",
+                min_value=10,
+                max_value=14,
+                value=12,
+                step=1,
+                help="Bu saatten önce dönen araçlar öğleden sonra kullanılabilir"
+            )
+        
+        with col_p2:
+            afternoon_start = st.slider(
+                "Öğleden Sonra Başlangıç",
+                min_value=12,
+                max_value=15,
+                value=13,
+                step=1,
+                help="Öğleden sonra vardiyası başlangıç saati"
+            )
+        
+        with col_p3:
+            reallocation_strategy = st.selectbox(
+                "Yeniden Atama Stratejisi",
+                [
+                    "Greedy (Hızlı)",
+                    "Savings (Clarke-Wright)",
+                    "2-opt Local Search",
+                ],
+                help="Siparişleri yeniden atamak için kullanılacak algoritma"
+            )
+        
+        if st.button("🚀 Çift Vardiya Optimizasyonu Çalıştır", type="primary"):
+            with st.spinner("Yeniden atama algoritması çalışıyor..."):
+                # Map strategy selection to function parameter
+                strategy_map = {
+                    "Greedy (Hızlı)": "greedy",
+                    "Savings (Clarke-Wright)": "clarke_wright",
+                    "2-opt Local Search": "2opt",
+                }
+                strategy_key = strategy_map.get(reallocation_strategy, "greedy")
+                
+                # Apply shift reallocation
+                result = apply_shift_reallocation(
+                    original_routes=selected_routes,
+                    data=data,
+                    morning_cutoff=morning_cutoff * 60,
+                    afternoon_start=afternoon_start * 60,
+                    afternoon_end=18 * 60,
+                    strategy=strategy_key,
+                )
+                
+                if not result["success"]:
+                    st.error(result["message"])
+                    st.stop()
+                
+                st.markdown("---")
+                st.markdown("### 📊 Optimizasyon Sonuçları")
+                
+                # Display selected solution type
+                st.success(f"✅ **{selected_solution}** çözümü baz alınarak **{reallocation_strategy}** "
+                          f"algoritması ile yeniden atama yapıldı!")
+                
+                # Metrics comparison
+                col_r1, col_r2, col_r3 = st.columns(3)
+                
+                original_metrics = result["original_metrics"]
+                combined_metrics = result["combined_metrics"]
+                
+                energy_improvement = ((original_metrics["total_energy_kwh"] - combined_metrics["total_energy_kwh"]) 
+                                     / original_metrics["total_energy_kwh"] * 100) if original_metrics["total_energy_kwh"] > 0 else 0
+                
+                with col_r1:
+                    st.metric(
+                        "Toplam Enerji (Orijinal)",
+                        f"{original_metrics['total_energy_kwh']:.2f} kWh"
+                    )
+                
+                with col_r2:
+                    st.metric(
+                        "Toplam Enerji (Çift Vardiya)",
+                        f"{combined_metrics['total_energy_kwh']:.2f} kWh",
+                        delta=f"{energy_improvement:.1f}% tasarruf" if energy_improvement > 0 else f"{energy_improvement:.1f}%",
+                        delta_color="normal" if energy_improvement > 0 else "inverse"
+                    )
+                
+                with col_r3:
+                    vehicle_reduction = original_metrics["active_vehicles"] - combined_metrics["total_vehicles_used"]
+                    st.metric(
+                        "Kullanılan Araç",
+                        combined_metrics["total_vehicles_used"],
+                        delta=f"{vehicle_reduction} araç azaldı" if vehicle_reduction > 0 else f"{-vehicle_reduction} araç arttı",
+                        delta_color="normal" if vehicle_reduction > 0 else "inverse"
+                    )
+                
+                # Breakdown
+                st.markdown("---")
+                st.markdown("### 📋 Vardiya Detayları")
+                
+                col_m, col_a = st.columns(2)
+                
+                with col_m:
+                    st.markdown("#### 🌅 Sabah Vardiyası (09:00-12:00)")
+                    morning_metrics = result["morning_metrics"]
+                    st.metric("Enerji", f"{morning_metrics['total_energy_kwh']:.2f} kWh")
+                    st.metric("Mesafe", f"{morning_metrics['total_distance_km']:.2f} km")
+                    st.metric("Aktif Araç", morning_metrics["active_vehicles"])
+                
+                with col_a:
+                    st.markdown(f"#### 🌇 Öğleden Sonra Vardiyası ({afternoon_start}:00-18:00)")
+                    afternoon_metrics = result["afternoon_metrics"]
+                    st.metric("Enerji", f"{afternoon_metrics['total_energy_kwh']:.2f} kWh")
+                    st.metric("Mesafe", f"{afternoon_metrics['total_distance_km']:.2f} km")
+                    st.metric("Aktif Araç", afternoon_metrics["active_vehicles"])
+                
+                # Route details
+                st.markdown("---")
+                st.markdown("### 🚚 Rota Detayları")
+                
+                # Validation info
+                col_v1, col_v2, col_v3 = st.columns(3)
+                with col_v1:
+                    st.metric("Sabah Müşteri", result.get("customers_in_morning", 0))
+                with col_v2:
+                    st.metric("Öğleden Sonra Müşteri", result.get("customers_in_afternoon", 0))
+                with col_v3:
+                    st.metric("Toplam Servis Edilen", result.get("total_customers_served", 0))
+                
+                # Verify no duplicates
+                all_morning = set()
+                for route in result["morning_routes"]:
+                    all_morning.update(route)
+                
+                all_afternoon = set()
+                for route in result["afternoon_routes"]:
+                    all_afternoon.update(route)
+                
+                duplicates = all_morning & all_afternoon
+                
+                if duplicates:
+                    st.error(f"❌ HATA: {len(duplicates)} müşteri hem sabah hem öğleden sonra atandı! {duplicates}")
+                else:
+                    st.success("✅ Doğrulama: Her müşteri sadece bir kez servis ediliyor (sabah VEYA öğleden sonra)")
+                
+                tab_morning, tab_afternoon = st.tabs(["🌅 Sabah Rotaları", "🌇 Öğleden Sonra Rotaları"])
+                
+                with tab_morning:
+                    st.write("**Sabah Vardiyası Rotaları:**")
+                    morning_routes = result["morning_routes"]
+                    for v_idx, route in enumerate(morning_routes):
+                        if route:
+                            st.write(f"Araç {v_idx + 1}: {len(route)} müşteri → {route[:5]}{'...' if len(route) > 5 else ''}")
+                
+                with tab_afternoon:
+                    st.write("**Öğleden Sonra Vardiyası Rotaları:**")
+                    afternoon_routes = result["afternoon_routes"]
+                    for v_idx, route in enumerate(afternoon_routes):
+                        if route:
+                            vehicle_id = result["early_vehicles"][v_idx] if v_idx < len(result["early_vehicles"]) else v_idx
+                            st.write(f"Araç {vehicle_id + 1}: {len(route)} müşteri → {route[:5]}{'...' if len(route) > 5 else ''}")
+                
+                # Summary
+                if energy_improvement > 0:
+                    st.success(f"🎉 Çift vardiya sistemi ile **{energy_improvement:.1f}%** enerji tasarrufu sağlandı!")
+                elif energy_improvement == 0:
+                    st.info("ℹ️ Enerji tüketimi aynı kaldı.")
+                else:
+                    st.warning(f"⚠️ Enerji tüketimi **{abs(energy_improvement):.1f}%** arttı. Farklı parametreler deneyin.")
+                
+                # Visualizations
+                st.markdown("---")
+                st.markdown("### 🗺️ Rota Görselleştirme")
+                
+                osrm_client = st.session_state.get("osrm_client")
+                
+                if osrm_client is None:
+                    st.warning("OSRM client bulunamadı. Harita gösterilemez.")
+                else:
+                    viz_tab1, viz_tab2, viz_tab3 = st.tabs([
+                        "🌅 Sabah Vardiyası Haritası",
+                        "🌇 Öğleden Sonra Vardiyası Haritası",
+                        "📊 Karşılaştırma"
+                    ])
+                    
+                    with viz_tab1:
+                        st.subheader("Sabah Vardiyası Rotaları (09:00-12:00)")
+                        
+                        if not result["morning_routes"] or all(not r for r in result["morning_routes"]):
+                            st.info("Sabah vardiyasında rota yok.")
+                        else:
+                            # Create a mock solution object for visualization
+                            class MockSolution:
+                                def __init__(self, routes_list):
+                                    self.routes = routes_list
+                            
+                            # Get weekday from session state if available
+                            selected_weekday = st.session_state.get("selected_weekday")
+                            
+                            with st.spinner("Sabah haritası oluşturuluyor..."):
+                                m_morning = visualize_routes_osrm(
+                                    depot_lat=DEPOT_LAT,
+                                    depot_lon=DEPOT_LON,
+                                    df_orders=df_orders,
+                                    data=data,
+                                    routing=None,
+                                    manager=None,
+                                    solution={"routes": result["morning_routes"]},
+                                    time_dim=None,
+                                    energy_dim=None,
+                                    osrm_client=osrm_client,
+                                    weekday=selected_weekday,
+                                )
+                                st_folium(m_morning, width=1200, height=700, key="morning_shift_map")
+                    
+                    with viz_tab2:
+                        st.subheader(f"Öğleden Sonra Vardiyası Rotaları ({afternoon_start}:00-18:00)")
+                        
+                        if not result["afternoon_routes"] or all(not r for r in result["afternoon_routes"]):
+                            st.info("Öğleden sonra vardiyasında rota yok.")
+                        else:
+                            # Get weekday from session state if available
+                            selected_weekday = st.session_state.get("selected_weekday")
+                            
+                            with st.spinner("Öğleden sonra haritası oluşturuluyor..."):
+                                m_afternoon = visualize_routes_osrm(
+                                    depot_lat=DEPOT_LAT,
+                                    depot_lon=DEPOT_LON,
+                                    df_orders=df_orders,
+                                    data=data,
+                                    routing=None,
+                                    manager=None,
+                                    solution={"routes": result["afternoon_routes"]},
+                                    time_dim=None,
+                                    energy_dim=None,
+                                    osrm_client=osrm_client,
+                                    weekday=selected_weekday,
+                                )
+                                st_folium(m_afternoon, width=1200, height=700, key="afternoon_shift_map")
+                    
+                    with viz_tab3:
+                        st.subheader("Orijinal vs Çift Vardiya Karşılaştırması")
+                        
+                        col_comp1, col_comp2 = st.columns(2)
+                        
+                        with col_comp1:
+                            st.markdown("#### 📦 Orijinal Çözüm (Tek Vardiya)")
+                            # Get weekday from session state if available
+                            selected_weekday = st.session_state.get("selected_weekday")
+                            
+                            with st.spinner("Orijinal harita oluşturuluyor..."):
+                                m_original = visualize_routes_osrm(
+                                    depot_lat=DEPOT_LAT,
+                                    depot_lon=DEPOT_LON,
+                                    df_orders=df_orders,
+                                    data=data,
+                                    routing=None,
+                                    manager=None,
+                                    solution={"routes": selected_routes},
+                                    time_dim=None,
+                                    energy_dim=None,
+                                    osrm_client=osrm_client,
+                                    weekday=selected_weekday,
+                                )
+                                st_folium(m_original, width=550, height=500, key="original_comparison_map")
+                            
+                            st.metric("Toplam Enerji", f"{original_metrics['total_energy_kwh']:.2f} kWh")
+                            st.metric("Aktif Araç", original_metrics["active_vehicles"])
+                        
+                        with col_comp2:
+                            st.markdown("#### 🔄 Çift Vardiya Çözümü")
+                            st.info(f"Sabah: {result.get('customers_in_morning', 0)} müşteri, "
+                                   f"Öğleden Sonra: {result.get('customers_in_afternoon', 0)} müşteri")
+                            
+                            st.metric("Toplam Enerji", f"{combined_metrics['total_energy_kwh']:.2f} kWh")
+                            st.metric("Toplam Rota", combined_metrics["total_vehicles_used"])
+                            
+                            if energy_improvement > 0:
+                                st.success(f"✅ {energy_improvement:.1f}% enerji tasarrufu")
+                            else:
+                                st.warning(f"⚠️ {abs(energy_improvement):.1f}% enerji artışı")
