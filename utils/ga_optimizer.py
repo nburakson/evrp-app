@@ -24,6 +24,14 @@ def leg_energy_kwh(d_km: float, load_before: float) -> float:
     return 0.436 * float(d_km) + 0.002 * float(load_before)
 
 
+def leg_energy_kwh_node_proxy(d_km: float, from_node_desi: float) -> float:
+    """
+    Tabu-compatible proxy for formula-based energy.
+    Uses known from-node desi term so both Tabu and GA can enforce the same model.
+    """
+    return 0.436 * float(d_km) + 0.002 * float(from_node_desi)
+
+
 def _base_energy_per_km(data) -> float:
     """
     Base kWh/km used by OR-Tools energy dimension (distance-only model).
@@ -36,8 +44,8 @@ def _base_energy_per_km(data) -> float:
 
 def route_energy_objective_pickup(route, D, demand, depot=0) -> float:
     """
-    Distance + load energy model:
-      Energy = 0.436 * distance + 0.002 * load_before
+        Tabu-compatible energy proxy model:
+            Energy = 0.436 * distance + 0.002 * from_node_desi
     
     Returns total energy consumption in kWh.
     """
@@ -45,22 +53,19 @@ def route_energy_objective_pickup(route, D, demand, depot=0) -> float:
         return 0.0
 
     E = 0.0
-    load = 0.0
 
     # depot -> first
     first = route[0]
-    E += leg_energy_kwh(D[depot, first], load)
-    load += demand[first]
+    E += leg_energy_kwh_node_proxy(D[depot, first], 0.0)
 
     # internal legs
     for i in range(len(route) - 1):
         a, b = route[i], route[i + 1]
-        E += leg_energy_kwh(D[a, b], load)
-        load += demand[b]
+        E += leg_energy_kwh_node_proxy(D[a, b], demand[a])
 
     # last -> depot
     last = route[-1]
-    E += leg_energy_kwh(D[last, depot], load)
+    E += leg_energy_kwh_node_proxy(D[last, depot], demand[last])
     return E
 
 
@@ -204,12 +209,14 @@ def _build_routes_from_sequence(sequence, ctx):
 
         travel = _leg_time_min(prev, node, t, ctx)
         leg_dist = float(D[prev, node])
-        leg_energy = leg_dist * base_energy
+        from_node_desi = float(demand[prev]) if prev != depot else 0.0
+        leg_energy = leg_energy_kwh_node_proxy(leg_dist, from_node_desi)
         svc = float(service[node])
 
         # Predict constraints including return to depot
         projected_load = load + demand[node]
-        projected_energy = energy + leg_energy + float(D[node, depot]) * base_energy
+        projected_return_energy = leg_energy_kwh_node_proxy(float(D[node, depot]), float(demand[node]))
+        projected_energy = energy + leg_energy + projected_return_energy
         projected_time = t + travel + svc + _leg_time_min(node, depot, t + travel + svc, ctx)
 
         violates = (
@@ -223,7 +230,8 @@ def _build_routes_from_sequence(sequence, ctx):
             v += 1
             travel = _leg_time_min(prev, node, t, ctx)
             leg_dist = float(D[prev, node])
-            leg_energy = leg_dist * base_energy
+            from_node_desi = float(demand[prev]) if prev != depot else 0.0
+            leg_energy = leg_energy_kwh_node_proxy(leg_dist, from_node_desi)
             svc = float(service[node])
 
         # Update state
@@ -250,12 +258,11 @@ def _build_routes_from_sequence(sequence, ctx):
         if load_total > cap:
             cap_penalty += (load_total - cap) * 1e5
 
-        # Distance-only battery model (same as OR-Tools energy dimension)
-        dist = D[depot, r[0]]
+        used_kwh = leg_energy_kwh_node_proxy(float(D[depot, r[0]]), 0.0)
         for i in range(len(r) - 1):
-            dist += D[r[i], r[i + 1]]
-        dist += D[r[-1], depot]
-        used_kwh = dist * base_energy
+            a, b = r[i], r[i + 1]
+            used_kwh += leg_energy_kwh_node_proxy(float(D[a, b]), float(demand[a]))
+        used_kwh += leg_energy_kwh_node_proxy(float(D[r[-1], depot]), float(demand[r[-1]]))
         if used_kwh > battery:
             energy_penalty += (used_kwh - battery) * 1e5
 
@@ -576,7 +583,7 @@ def print_ga_detailed_solution(data, routes, df_orders):
         f = route[0]
         d = float(D[depot, f])
         travel_t = _leg_time_min(depot, f, t_now, ctx)
-        E = leg_energy_kwh(d, load)  # load is 0 before first customer
+        E = leg_energy_kwh_node_proxy(d, 0.0)
         svc = float(service[f])
 
         arr = t_now + travel_t
@@ -599,7 +606,7 @@ def print_ga_detailed_solution(data, routes, df_orders):
             a, b = route[i], route[i + 1]
             d = float(D[a, b])
             travel_t = _leg_time_min(a, b, t_now, ctx)
-            E = leg_energy_kwh(d, load)  # load accumulates
+            E = leg_energy_kwh_node_proxy(d, float(demand[a]))
             svc = float(service[b])
 
             arr = t_now + travel_t
@@ -621,7 +628,7 @@ def print_ga_detailed_solution(data, routes, df_orders):
         last = route[-1]
         d = float(D[last, depot])
         travel_t = _leg_time_min(last, depot, t_now, ctx)
-        E = leg_energy_kwh(d, load)  # final leg carries full load
+        E = leg_energy_kwh_node_proxy(d, float(demand[last]))
         arr = t_now + travel_t
 
         txt.append(
