@@ -1466,7 +1466,6 @@ with tab6:
             allow_multitrip = (solver_mode == "Çoklu Tur (Multi-Trip)")
             if allow_multitrip:
                 st.info("🔄 Multi-Trip solver etkin: araçlar depoda yeni göreve çıkabilir.")
-            st.caption("Not: Tabu çözücüde enerji kısıtı mesafe bazlıdır. Formül bazlı (0.436×km + 0.002×desi) rota optimizasyonu için GA ve 7️⃣ Multi-Trip sekmesini kullanın.")
 
             if st.button("🚀 Çöz", key="evrp_tab2_run_solver"):
                 import time
@@ -2304,7 +2303,6 @@ with tab6:
                     st.info("İstatistik hesaplanamadı.")
 
     st.markdown("---")
-    st.info("⚡ Elektrikli Araç Atama Sistemi kaldırıldı. Akış: Tabu/GA çözümü → 7️⃣ Multi-Trip Optimizasyonu (formül bazlı).")
 
 # =========================================================
 # 7️⃣ ÇOKLU GÖREV (MULTI-TRIP) OPTİMİZASYONU
@@ -2568,15 +2566,6 @@ with tab7:
             with k4:
                 st.metric("Toplam Enerji (kWh)", f"{mt_total_energy:.2f}", delta=f"{(mt_total_energy - orig_total_energy):.2f}")
 
-            st.markdown("### Grafik Karşılaştırma")
-            chart_df = pd.DataFrame([
-                {"Metrik": "Süre (dk)", "Orijinal": orig_total_time, "Multi-Trip": mt_total_time},
-                {"Metrik": "Mesafe (km)", "Orijinal": orig_total_dist, "Multi-Trip": mt_total_dist},
-                {"Metrik": "Yük (desi)", "Orijinal": orig_total_load, "Multi-Trip": mt_total_load},
-                {"Metrik": "Enerji (kWh)", "Orijinal": orig_total_energy, "Multi-Trip": mt_total_energy},
-            ]).set_index("Metrik")
-            st.bar_chart(chart_df)
-
             st.markdown("### Araç Bazlı Orijinal vs Multi-Trip")
             max_rows = max(len(saved_original), len(saved_assignments))
             compare_rows = []
@@ -2615,34 +2604,49 @@ with tab7:
 
             st.dataframe(pd.DataFrame(compare_rows), use_container_width=True)
 
-            st.markdown("### Multi-Trip Araç Detayı")
-            detail_rows = []
-            for v in saved_assignments:
-                detail_rows.append({
-                    "Araç": f"Araç {v['vehicle_id']}",
-                    "Görev Sayısı": v["num_trips"],
-                    "Görevler": ", ".join([f"G{j['job_id']}" for j in v["jobs"]]),
-                    "Süre (dk)": round(v["time_min"], 1),
-                    "Mesafe (km)": round(v["distance_km"], 2),
-                    "Yük (desi)": round(v["load_desi"], 0),
-                    "Enerji (kWh)": round(v["energy_kwh"], 2),
-                    "Kalan Enerji (kWh)": round(v["remaining_energy_kwh"], 2),
-                })
-            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True)
-
             st.markdown("### Harita Karşılaştırması")
             osrm_client = st.session_state.get("osrm_client")
 
             if osrm_client is None or df_orders is None:
                 st.info("Harita için gerekli veri eksik (orders/osrm_client).")
             else:
+                original_vehicle_options = [f"Araç {i + 1}" for i in range(len(saved_original))]
+                multitrip_vehicle_options = [f"Araç {v['vehicle_id']}" for v in saved_assignments]
+
+                filter_col1, filter_col2 = st.columns(2)
+                with filter_col1:
+                    selected_original_vehicles = st.multiselect(
+                        "Orijinal çözüm araç filtresi",
+                        options=original_vehicle_options,
+                        default=original_vehicle_options,
+                        key="multitrip_original_vehicle_filter",
+                    )
+                with filter_col2:
+                    selected_multitrip_vehicles = st.multiselect(
+                        "Multi-Trip çözüm araç filtresi",
+                        options=multitrip_vehicle_options,
+                        default=multitrip_vehicle_options,
+                        key="multitrip_vehicle_filter",
+                    )
+
                 map_col1, map_col2 = st.columns(2)
 
-                original_routes_for_map = [j["route"] for j in saved_original if j.get("route")]
+                selected_original_ids = {
+                    int(label.replace("Araç ", ""))
+                    for label in selected_original_vehicles
+                }
+                original_routes_for_map = [
+                    j["route"]
+                    for idx, j in enumerate(saved_original, start=1)
+                    if idx in selected_original_ids and j.get("route")
+                ]
 
                 multitrip_routes_for_map = []
                 multitrip_labels = []
                 for v in saved_assignments:
+                    vehicle_label = f"Araç {v['vehicle_id']}"
+                    if vehicle_label not in selected_multitrip_vehicles:
+                        continue
                     if not v.get("jobs"):
                         continue
                     combined_route = []
