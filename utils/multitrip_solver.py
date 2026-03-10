@@ -125,20 +125,25 @@ def solve_multitrip_ortools(
     # ENERGY DIMENSION (with depot recharge)
     # ----------------------------------------
     BASE_KWH_PER_KM = 0.436
+    LOAD_TERM = 0.002
     battery_capacity = float(data.get("battery_capacity", 100.0))
+    reserve_soc_pct = float(data.get("min_return_soc_pct", 0.0))
+    usable_battery = battery_capacity * (1.0 - reserve_soc_pct / 100.0)
     
     def energy_cb(i_idx, j_idx):
         i = manager.IndexToNode(i_idx)
         j = manager.IndexToNode(j_idx)
         d_km = float(data["distance_km"][i, j])
-        return int(round(d_km * BASE_KWH_PER_KM))
+        from_node_desi = float(demands[i]) if i != depot else 0.0
+        e_kwh = BASE_KWH_PER_KM * d_km + LOAD_TERM * from_node_desi
+        return int(round(e_kwh))
     
     energy_transit = routing.RegisterTransitCallback(energy_cb)
     
     routing.AddDimension(
         energy_transit,
-        int(round(battery_capacity)) if allow_multi_trip else 0,  # slack allows recharge at depot
-        int(round(battery_capacity)),
+        int(round(usable_battery)) if allow_multi_trip else 0,  # slack allows recharge at depot
+        int(round(usable_battery)),
         True,  # starts with 0 energy consumed
         "Energy",
     )
