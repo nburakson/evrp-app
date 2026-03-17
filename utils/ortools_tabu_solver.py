@@ -14,7 +14,7 @@ def solve_with_ortools_tabu(data, time_limit_s: int = 10, seed: int = 42):
 
     This solver enforces:
     - Pickup model (load starts at 0 and increases with each visit)
-    - Energy constraint: distance * 0.436  (no load component)
+    - Energy constraint (formula proxy): 0.436 * distance + 0.002 * from-node desi
     - Normal time + service time constraints
     """
 
@@ -105,22 +105,27 @@ def solve_with_ortools_tabu(data, time_limit_s: int = 10, seed: int = 42):
     # ENERGY DIMENSION (distance-only model)
     # ----------------------------------------
     BASE_KWH_PER_KM = 0.436
+    LOAD_TERM = 0.002
     battery_capacity = float(
         data.get("battery_capacity", data.get("battery_kwh", 100.0))
     )
+    reserve_soc_pct = float(data.get("min_return_soc_pct", 0.0))
+    usable_battery = battery_capacity * (1.0 - reserve_soc_pct / 100.0)
 
     def energy_cb(i_idx, j_idx):
         i = manager.IndexToNode(i_idx)
         j = manager.IndexToNode(j_idx)
         d_km = float(data["distance_km"][i, j])
-        return int(round(d_km * BASE_KWH_PER_KM ))
+        from_node_desi = float(demands[i]) if i != data["depot"] else 0.0
+        e_kwh = BASE_KWH_PER_KM * d_km + LOAD_TERM * from_node_desi
+        return int(round(e_kwh))
 
     energy_transit = routing.RegisterTransitCallback(energy_cb)
 
     routing.AddDimension(
         energy_transit,
         0,
-        int(round(battery_capacity)),  # battery units = kWh allowed
+        int(round(usable_battery)),  # usable battery after reserve policy
         True,  # starts with 0 energy consumed
         "Energy",
     )

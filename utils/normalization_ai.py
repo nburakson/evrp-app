@@ -4,8 +4,16 @@ import re
 import unicodedata
 import streamlit as st
 
+
+def _get_streamlit_secret(name: str):
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
 # Load separate key for normalization only
-NORMALIZER_KEY = os.getenv("OPENAI_NORMALIZER_KEY") or st.secrets.get("OPENAI_NORMALIZER_KEY")
+NORMALIZER_KEY = os.getenv("OPENAI_NORMALIZER_KEY") or _get_streamlit_secret("OPENAI_NORMALIZER_KEY")
 openai.api_key = NORMALIZER_KEY
 
 
