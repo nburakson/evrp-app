@@ -72,6 +72,18 @@ def df_to_orders(df_orders: pd.DataFrame):
     ]
 
 
+def render_folium_safe(map_obj, width: int, height: int, key: str | None = None):
+    """Render folium map with component fallback for environments where st_folium assets fail to load."""
+    try:
+        if key is None:
+            st_folium(map_obj, width=width, height=height)
+        else:
+            st_folium(map_obj, width=width, height=height, key=key)
+    except Exception:
+        st.warning("Harita bileşeni yüklenemedi; HTML fallback ile gösteriliyor.")
+        st.components.v1.html(map_obj._repr_html_(), width=width, height=height, scrolling=False)
+
+
 # =========================================================
 # PAGE CONFIG
 # =========================================================
@@ -1029,7 +1041,7 @@ with tab3:
 
         _, col_map, _ = st.columns([1, 6, 1])
         with col_map:
-            st_folium(m, width=1200, height=750)
+            render_folium_safe(m, width=1200, height=750)
 
 
 # =========================================================
@@ -1227,11 +1239,12 @@ with tab5:
 with tab6:
     st.header("📦 Problem Çözümü")
 
-    evrp_tab1, evrp_tab2, evrp_tab3, evrp_tab4 = st.tabs(
+    evrp_tab1, evrp_tab2, evrp_tab3, evrp_tab4, evrp_tab5 = st.tabs(
         [
             "📦 Problem Kurulumu",
             "🧠 Tabu Search",
             "🧬 Genetik Algoritma",
+            "🚛 Multi-Trip",
             "🗺 Çözümü Haritada Göster",
         ]
     )
@@ -1447,50 +1460,32 @@ with tab6:
             st.warning(
                 "Önce 'Problem Kurulumu' sekmesinde EVRP modelini oluşturun.")
         else:
-            col_solver1, col_solver2, col_solver3 = st.columns(3)
+            col_solver1, col_solver2 = st.columns(2)
 
             with col_solver1:
                 time_limit = st.number_input(
                     "Zaman limiti (saniye)", min_value=1, value=10)
             with col_solver2:
                 seed = st.number_input("Random Seed", min_value=0, value=42)
-            with col_solver3:
-                solver_mode = st.selectbox(
-                    "Çözücü Modu",
-                    ["Tek Tur (Tabu)", "Çoklu Tur (Multi-Trip)"],
-                    help="Çoklu Tur: Araçlar yeterli enerji ve zaman varsa depoya dönüp yeni tur yapabilir"
-                )
 
             st.markdown("---")
-
-            allow_multitrip = (solver_mode == "Çoklu Tur (Multi-Trip)")
-            if allow_multitrip:
-                st.info("🔄 Multi-Trip solver etkin: araçlar depoda yeni göreve çıkabilir.")
+            st.info("Bu sekmede yalnızca Tek Tur (Tabu) çözümü çalıştırılır.")
 
             if st.button("🚀 Çöz", key="evrp_tab2_run_solver"):
                 import time
                 start_time = time.time()
 
-                if allow_multitrip:
-                    from utils.multitrip_solver import solve_multitrip_ortools
-                    with st.spinner("Multi-Trip solver çalışıyor..."):
-                        result = solve_multitrip_ortools(
-                            data,
-                            time_limit_s=int(time_limit),
-                            seed=int(seed),
-                            allow_multi_trip=True,
-                        )
-                else:
-                    with st.spinner("Tabu Search solver çalışıyor..."):
-                        result = solve_with_ortools_tabu(
-                            data,
-                            time_limit_s=int(time_limit),
-                            seed=int(seed),
-                        )
+                with st.spinner("Tabu Search solver çalışıyor..."):
+                    result = solve_with_ortools_tabu(
+                        data,
+                        time_limit_s=int(time_limit),
+                        seed=int(seed),
+                    )
 
                 elapsed = time.time() - start_time
                 st.session_state["tabu_result"] = result
-                st.session_state["solver_mode"] = solver_mode
+                st.session_state["solver_mode"] = "Tek Tur (Tabu)"
+                st.session_state["tab6_multitrip_used"] = False
 
                 if result.get("solution") is not None:
                     routes = extract_routes_from_solution(
@@ -1733,12 +1728,239 @@ with tab6:
 
                 st.text_area("GA Detaylı Çıktı", txt_ga, height=600)
 
-    # ---------- TAB 4: Solution Maps ----------
+    # ---------- TAB 4: Multi-Trip (Independent ALNS+MIP) ----------
     with evrp_tab4:
+        st.subheader("🚛 Multi-Trip (ALNS + MIP)")
+
+        data = st.session_state.get("ortools_data")
+
+        if data is None:
+            st.warning("Önce EVRP modelini oluşturun.")
+        else:
+            from utils.alns_multitrip_solver import solve_multitrip_alns_mip
+            from utils.multitrip_solver import solve_multitrip_ortools
+
+            D = np.array(data["distance_km"], dtype=float)
+            T = np.array(data["time_min"], dtype=float)
+            loads = np.array(data["demand_desi"], dtype=float)
+            service = np.array(data.get("service_min", np.zeros(len(loads))), dtype=float)
+            depot = int(data.get("depot", 0))
+            battery_capacity = float(data.get("battery_capacity", 100.0))
+
+            st.markdown("### Bağımsız Multi-Trip Çözümü (ALNS + MIP)")
+            st.caption("Bu sekmede bağımsız multi-trip çözümü ALNS ile üretilir ve MIP polishing ile iyileştirilir.")
+
+            mtc1, mtc2 = st.columns(2)
+            with mtc1:
+                mt_time_limit = st.number_input(
+                    "Multi-Trip zaman limiti (saniye)",
+                    min_value=1,
+                    value=20,
+                    key="tab6_mt_direct_time_limit",
+                )
+            with mtc2:
+                mt_seed = st.number_input(
+                    "Multi-Trip random seed",
+                    min_value=0,
+                    value=42,
+                    key="tab6_mt_direct_seed",
+                )
+
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                alns_iterations = st.number_input(
+                    "ALNS iterasyon",
+                    min_value=50,
+                    max_value=5000,
+                    value=400,
+                    step=50,
+                    key="tab6_mt_direct_alns_iterations",
+                )
+            with a2:
+                alns_destroy_rate = st.slider(
+                    "ALNS destroy oranı",
+                    min_value=0.10,
+                    max_value=0.60,
+                    value=0.25,
+                    step=0.05,
+                    key="tab6_mt_direct_alns_destroy_rate",
+                )
+            with a3:
+                mip_time_limit = st.number_input(
+                    "MIP polishing süre limiti (sn)",
+                    min_value=1,
+                    max_value=30,
+                    value=5,
+                    step=1,
+                    key="tab6_mt_direct_mip_time_limit",
+                )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                max_shift_duration = st.number_input(
+                    "Maksimum vardiya süresi (dk)",
+                    min_value=240,
+                    max_value=720,
+                    value=540,
+                    step=30,
+                    key="tab6_mt_direct_max_shift",
+                )
+            with c2:
+                min_return_pct = st.number_input(
+                    "Minimum dönüş şarjı (%)",
+                    min_value=0,
+                    max_value=90,
+                    value=20,
+                    step=5,
+                    key="tab6_mt_direct_min_return_pct",
+                )
+
+            depot_service_time = st.number_input(
+                "Depo servis süresi (dk)",
+                min_value=0,
+                max_value=60,
+                value=15,
+                step=5,
+                key="tab6_mt_direct_depot_service",
+            )
+
+            usable_energy = battery_capacity * (1.0 - float(min_return_pct) / 100.0)
+            st.caption(
+                f"Toplam batarya: {battery_capacity:.2f} kWh | Kullanılabilir enerji: {usable_energy:.2f} kWh"
+            )
+
+            if st.button("🚀 Bağımsız Multi-Trip Çöz", key="tab6_mt_direct_run"):
+                with st.spinner("Bağımsız Multi-Trip solver çalışıyor..."):
+                    mt_result = solve_multitrip_ortools(
+                        data,
+                        time_limit_s=int(mt_time_limit),
+                        seed=int(mt_seed),
+                        allow_multi_trip=True,
+                    )
+
+                st.session_state["multitrip_direct_result"] = mt_result
+
+                if mt_result.get("solution") is not None:
+                    mt_routes = extract_routes_from_solution(
+                        data,
+                        mt_result["routing"],
+                        mt_result["manager"],
+                        mt_result["solution"],
+                    )
+
+                    original_jobs = []
+                    for i, route in enumerate(mt_routes):
+                        if not route:
+                            continue
+                        total_km = 0.0
+                        total_time = 0.0
+                        total_load = 0.0
+                        total_energy = 0.0
+                        prev = depot
+                        cum_load = 0.0
+
+                        for node in route:
+                            if node < 0 or node >= len(loads):
+                                continue
+                            d_km = float(D[prev, node])
+                            t_min = float(T[prev, node])
+                            total_km += d_km
+                            total_time += t_min + float(service[node])
+                            total_energy += 0.436 * d_km + 0.002 * cum_load
+                            node_load = float(loads[node])
+                            cum_load += node_load
+                            total_load += node_load
+                            prev = node
+
+                        d_km = float(D[prev, depot])
+                        t_min = float(T[prev, depot])
+                        total_km += d_km
+                        total_time += t_min
+                        total_energy += 0.436 * d_km + 0.002 * cum_load
+
+                        original_jobs.append({
+                            "job_id": i + 1,
+                            "route": route,
+                            "time_min": total_time,
+                            "distance_km": total_km,
+                            "load_desi": total_load,
+                            "energy_kwh": total_energy,
+                        })
+
+                    with st.spinner("ALNS + MIP polishing ile atama iyileştiriliyor..."):
+                        alns_result = solve_multitrip_alns_mip(
+                            jobs=original_jobs,
+                            max_shift_duration=float(max_shift_duration),
+                            usable_energy=float(usable_energy),
+                            depot_service_time=float(depot_service_time),
+                            battery_capacity=float(battery_capacity),
+                            iterations=int(alns_iterations),
+                            destroy_rate=float(alns_destroy_rate),
+                            seed=int(mt_seed),
+                            mip_time_limit_s=int(mip_time_limit),
+                        )
+
+                    vehicle_assignments = alns_result.get("assignments", [])
+                    dropped_jobs = alns_result.get("dropped_jobs", [])
+
+                    st.session_state["multitrip_assignments"] = vehicle_assignments
+                    st.session_state["multitrip_original_jobs"] = original_jobs
+                    st.session_state["multitrip_base_solution"] = "Tab6 Independent ALNS+MIP"
+                    st.session_state["tab6_multitrip_used"] = True
+
+                    if dropped_jobs:
+                        st.warning(
+                            f"{len(dropped_jobs)} rota zaman/enerji sınırını tek başına aştığı için atamaya dahil edilmedi."
+                        )
+
+                    served_mt = sum(len(r) for r in mt_routes)
+                    st.success(
+                        f"Bağımsız Multi-Trip çözümü üretildi. {served_mt} müşteri servis edildi. "
+                        f"ALNS + MIP sonrası araç sayısı: {len(vehicle_assignments)}"
+                    )
+                    st.text_area(
+                        "ALNS + MIP Log",
+                        value=alns_result.get("log", ""),
+                        height=220,
+                        key="tab6_mt_direct_alns_log",
+                    )
+                else:
+                    st.error("Bağımsız Multi-Trip çözümü bulunamadı.")
+
+                st.text_area(
+                    "Bağımsız Multi-Trip Çözücü Log",
+                    value=mt_result.get("log", ""),
+                    height=240,
+                    key="tab6_mt_direct_log",
+                )
+
+            st.markdown("---")
+            st.info("Tabu/GA sonrası Multi-Trip optimizasyonu için 7️⃣ Çoklu Görev Optimizasyonu sekmesini kullanın.")
+
+            saved_assignments = st.session_state.get("multitrip_assignments")
+            saved_source = st.session_state.get("multitrip_base_solution")
+            if saved_assignments and saved_source == "Tab6 Independent ALNS+MIP":
+                st.markdown("### Multi-Trip Rotalar ve Araç Atamaları")
+                rows = []
+                for v in saved_assignments:
+                    rows.append({
+                        "Araç": f"Araç {v['vehicle_id']}",
+                        "Görev Sayısı": int(v["num_trips"]),
+                        "Süre (dk)": round(v["time_min"], 1),
+                        "Mesafe (km)": round(v["distance_km"], 2),
+                        "Yük (desi)": round(v["load_desi"], 0),
+                        "Enerji (kWh)": round(v["energy_kwh"], 2),
+                        "Kalan Enerji (kWh)": round(v["remaining_energy_kwh"], 2),
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # ---------- TAB 5: Solution Maps ----------
+    with evrp_tab5:
         st.subheader("🗺 Çözümü Haritada Göster")
 
         tabu_result = st.session_state.get("tabu_result")
         ga_routes = st.session_state.get("ga_best_routes")
+        mt_assignments = st.session_state.get("multitrip_assignments")
         data = st.session_state.get("ortools_data")
         df_orders = st.session_state.get("orders_df")
         osrm_client = st.session_state.get("osrm_client")
@@ -1747,21 +1969,18 @@ with tab6:
         has_tabu = tabu_result is not None and tabu_result.get(
             "solution") is not None
         has_ga = ga_routes is not None
+        has_mt = mt_assignments is not None and len(mt_assignments) > 0
 
         if data is None or df_orders is None:
             st.warning(
                 "Önce 'Problem Kurulumu' sekmesinde EVRP modelini oluşturun.")
-        elif not has_tabu and not has_ga:
-            st.info("Önce Tabu Search veya GA çözümünü oluşturun.")
+        elif not has_tabu and not has_ga and not has_mt:
+            st.info("Önce Tabu Search, GA veya Multi-Trip çözümünü oluşturun.")
         else:
             # Display based on what's available
-            if has_tabu and has_ga:
-                st.markdown("### 🔄 Tabu vs GA Karşılaştırması")
-                st.info("GA haritası, rota sayısı ve OSRM geometri çağrıları arttıkça yavaşlar. Aşağıdaki araç filtresi ile hızlanır.")
-
-                routing = tabu_result["routing"]
-                manager = tabu_result["manager"]
-                solution = tabu_result["solution"]
+            if has_tabu or has_ga or has_mt:
+                st.markdown("### 🔄 Çözüm Karşılaştırması")
+                st.info("Aşağıdan görmek istediğiniz çözüm türlerini seçin. Araç filtresi tüm seçili çözüm türleri için ortaktır.")
 
                 D = np.array(data["distance_km"], dtype=float)
                 T = np.array(data["time_min"], dtype=float)
@@ -1770,15 +1989,19 @@ with tab6:
 
                 # Extract tabu routes once
                 tabu_routes = []
-                for v in range(data["num_vehicles"]):
-                    idx = routing.Start(v)
-                    route = []
-                    while not routing.IsEnd(idx):
-                        node = manager.IndexToNode(idx)
-                        if node != depot:
-                            route.append(node)
-                        idx = solution.Value(routing.NextVar(idx))
-                    tabu_routes.append(route)
+                if has_tabu:
+                    routing = tabu_result["routing"]
+                    manager = tabu_result["manager"]
+                    solution = tabu_result["solution"]
+                    for v in range(data["num_vehicles"]):
+                        idx = routing.Start(v)
+                        route = []
+                        while not routing.IsEnd(idx):
+                            node = manager.IndexToNode(idx)
+                            if node != depot:
+                                route.append(node)
+                            idx = solution.Value(routing.NextVar(idx))
+                        tabu_routes.append(route)
 
                 def route_metrics(route):
                     if not route:
@@ -1825,7 +2048,38 @@ with tab6:
                         "customers": len(route),
                     }
 
-                max_vehicles = max(len(tabu_routes), len(ga_routes))
+                mt_routes = []
+                if has_mt:
+                    for v in mt_assignments:
+                        combined_route = []
+                        jobs = v.get("jobs", [])
+                        for i, j in enumerate(jobs):
+                            combined_route.extend(j.get("route", []))
+                            if i < len(jobs) - 1:
+                                combined_route.append(depot)
+                        mt_routes.append(combined_route)
+
+                copt1, copt2, copt3 = st.columns(3)
+                with copt1:
+                    show_tabu = st.checkbox("Tabu", value=has_tabu, disabled=not has_tabu, key="map_show_tabu")
+                with copt2:
+                    show_ga = st.checkbox("GA", value=has_ga, disabled=not has_ga, key="map_show_ga")
+                with copt3:
+                    show_mt = st.checkbox("Multi-Trip", value=has_mt, disabled=not has_mt, key="map_show_mt")
+
+                solution_counts = []
+                if show_tabu:
+                    solution_counts.append(len(tabu_routes))
+                if show_ga:
+                    solution_counts.append(len(ga_routes))
+                if show_mt:
+                    solution_counts.append(len(mt_routes))
+
+                if not solution_counts:
+                    st.warning("En az bir çözüm türü seçin.")
+                    max_vehicles = 0
+                else:
+                    max_vehicles = max(solution_counts)
                 st.markdown("### 🚚 Araç Filtresi")
                 f1, f2 = st.columns(2)
                 with f1:
@@ -1838,136 +2092,117 @@ with tab6:
                             st.session_state[f"cmp_vehicle_sel_{i}"] = False
 
                 selected_vehicles = []
-                filter_cols = st.columns(4)
-                for i in range(max_vehicles):
-                    key = f"cmp_vehicle_sel_{i}"
-                    default_val = st.session_state.get(key, False)
-                    with filter_cols[i % 4]:
-                        if st.checkbox(f"Araç {i+1}", value=default_val, key=key):
-                            selected_vehicles.append(i)
+                if max_vehicles > 0:
+                    filter_cols = st.columns(4)
+                    for i in range(max_vehicles):
+                        key = f"cmp_vehicle_sel_{i}"
+                        if key not in st.session_state:
+                            st.session_state[key] = False
+                        with filter_cols[i % 4]:
+                            if st.checkbox(f"Araç {i+1}", key=key):
+                                selected_vehicles.append(i)
 
                 if not selected_vehicles:
                     st.warning("En az bir araç seçin.")
                 else:
-                    map_col1, map_col2 = st.columns(2)
+                    selected_methods = []
+                    if show_tabu:
+                        selected_methods.append("tabu")
+                    if show_ga:
+                        selected_methods.append("ga")
+                    if show_mt:
+                        selected_methods.append("mt")
 
-                    # TABU PANEL
-                    with map_col1:
-                        st.markdown("#### 🧠 Tabu Search")
-                        selected_tabu_routes = [tabu_routes[i] for i in selected_vehicles if i < len(tabu_routes) and tabu_routes[i]]
-                        if selected_tabu_routes:
-                            with st.spinner("Tabu haritası oluşturuluyor..."):
-                                m_tabu = visualize_routes_osrm(
-                                    depot_lat=DEPOT_LAT,
-                                    depot_lon=DEPOT_LON,
-                                    df_orders=df_orders,
-                                    data=data,
-                                    routing=None,
-                                    manager=None,
-                                    solution={"routes": selected_tabu_routes},
-                                    time_dim=None,
-                                    energy_dim=None,
-                                    osrm_client=osrm_client,
-                                    weekday=st.session_state.get("selected_weekday"),
-                                )
-                                st_folium(m_tabu, width=550, height=500, key="comparison_map_tabu_filtered")
+                    method_cols = st.columns(len(selected_methods))
+                    totals_rows = []
 
-                        tabu_rows = []
-                        for i in selected_vehicles:
-                            route = tabu_routes[i] if i < len(tabu_routes) else []
-                            m = route_metrics(route)
-                            if route:
-                                tabu_rows.append({
-                                    "Araç": f"Araç {i+1}",
-                                    "Müşteri": m["customers"],
-                                    "Süre (dk)": round(m["time"], 1),
-                                    "Mesafe (km)": round(m["km"], 2),
-                                    "Yük (desi)": round(m["load"], 0),
-                                    "Enerji (kWh)": round(m["energy"], 2),
+                    for m_idx, method_name in enumerate(selected_methods):
+                        with method_cols[m_idx]:
+                            if method_name == "tabu":
+                                st.markdown("#### 🧠 Tabu Search")
+                                selected_routes = [tabu_routes[i] for i in selected_vehicles if i < len(tabu_routes) and tabu_routes[i]]
+                                panel_key = "comparison_map_tabu_filtered"
+                                rows = []
+                                for i in selected_vehicles:
+                                    route = tabu_routes[i] if i < len(tabu_routes) else []
+                                    rm = route_metrics(route)
+                                    if route:
+                                        rows.append({
+                                            "Araç": f"Araç {i+1}",
+                                            "Müşteri": rm["customers"],
+                                            "Süre (dk)": round(rm["time"], 1),
+                                            "Mesafe (km)": round(rm["km"], 2),
+                                            "Yük (desi)": round(rm["load"], 0),
+                                            "Enerji (kWh)": round(rm["energy"], 2),
+                                        })
+                            elif method_name == "ga":
+                                st.markdown("#### 🧬 Genetic Algorithm")
+                                selected_routes = [ga_routes[i] for i in selected_vehicles if i < len(ga_routes) and ga_routes[i]]
+                                panel_key = "comparison_map_ga_filtered"
+                                rows = []
+                                for i in selected_vehicles:
+                                    route = ga_routes[i] if i < len(ga_routes) else []
+                                    rm = route_metrics(route)
+                                    if route:
+                                        rows.append({
+                                            "Araç": f"Araç {i+1}",
+                                            "Müşteri": rm["customers"],
+                                            "Süre (dk)": round(rm["time"], 1),
+                                            "Mesafe (km)": round(rm["km"], 2),
+                                            "Yük (desi)": round(rm["load"], 0),
+                                            "Enerji (kWh)": round(rm["energy"], 2),
+                                        })
+                            else:
+                                st.markdown("#### 🚛 Multi-Trip")
+                                selected_routes = [mt_routes[i] for i in selected_vehicles if i < len(mt_routes) and mt_routes[i]]
+                                panel_key = "comparison_map_mt_filtered"
+                                rows = []
+                                for i in selected_vehicles:
+                                    if i < len(mt_assignments):
+                                        a = mt_assignments[i]
+                                        rows.append({
+                                            "Araç": f"Araç {i+1}",
+                                            "Müşteri": sum(len(j.get("route", [])) for j in a.get("jobs", [])),
+                                            "Süre (dk)": round(a.get("time_min", 0.0), 1),
+                                            "Mesafe (km)": round(a.get("distance_km", 0.0), 2),
+                                            "Yük (desi)": round(a.get("load_desi", 0.0), 0),
+                                            "Enerji (kWh)": round(a.get("energy_kwh", 0.0), 2),
+                                        })
+
+                            if selected_routes:
+                                with st.spinner("Harita oluşturuluyor..."):
+                                    m_panel = visualize_routes_osrm(
+                                        depot_lat=DEPOT_LAT,
+                                        depot_lon=DEPOT_LON,
+                                        df_orders=df_orders,
+                                        data=data,
+                                        routing=None,
+                                        manager=None,
+                                        solution={"routes": selected_routes},
+                                        time_dim=None,
+                                        energy_dim=None,
+                                        osrm_client=osrm_client,
+                                        weekday=st.session_state.get("selected_weekday"),
+                                    )
+                                    render_folium_safe(m_panel, width=520, height=460, key=panel_key)
+
+                            st.markdown("**Özet**")
+                            if rows:
+                                rdf = pd.DataFrame(rows)
+                                st.dataframe(rdf, use_container_width=True)
+                                totals_rows.append({
+                                    "Çözüm": method_name.upper(),
+                                    "Mesafe (km)": round(rdf["Mesafe (km)"].sum(), 2),
+                                    "Süre (dk)": round(rdf["Süre (dk)"].sum(), 1),
+                                    "Yük (desi)": round(rdf["Yük (desi)"].sum(), 0),
+                                    "Enerji (kWh)": round(rdf["Enerji (kWh)"].sum(), 2),
                                 })
+                            else:
+                                st.info("Seçili araçlarda rota yok.")
 
-                        st.markdown("**Özet**")
-                        if tabu_rows:
-                            tdf = pd.DataFrame(tabu_rows)
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                st.metric("Toplam Mesafe", f"{tdf['Mesafe (km)'].sum():.2f} km")
-                                st.metric("Toplam Süre", f"{tdf['Süre (dk)'].sum():.1f} dk")
-                            with c2:
-                                st.metric("Toplam Yük", f"{tdf['Yük (desi)'].sum():.0f} desi")
-                                st.metric("Toplam Enerji", f"{tdf['Enerji (kWh)'].sum():.2f} kWh")
-                            st.dataframe(tdf, use_container_width=True)
-                        else:
-                            st.info("Seçili araçlarda Tabu rota yok.")
-
-                    # GA PANEL
-                    with map_col2:
-                        st.markdown("#### 🧬 Genetic Algorithm")
-                        selected_ga_routes = [ga_routes[i] for i in selected_vehicles if i < len(ga_routes) and ga_routes[i]]
-                        if selected_ga_routes:
-                            with st.spinner("GA haritası oluşturuluyor..."):
-                                m_ga = visualize_routes_osrm(
-                                    depot_lat=DEPOT_LAT,
-                                    depot_lon=DEPOT_LON,
-                                    df_orders=df_orders,
-                                    data=data,
-                                    routing=None,
-                                    manager=None,
-                                    solution={"routes": selected_ga_routes},
-                                    time_dim=None,
-                                    energy_dim=None,
-                                    osrm_client=osrm_client,
-                                    weekday=st.session_state.get("selected_weekday"),
-                                )
-                                st_folium(m_ga, width=550, height=500, key="comparison_map_ga_filtered")
-
-                        ga_rows = []
-                        for i in selected_vehicles:
-                            route = ga_routes[i] if i < len(ga_routes) else []
-                            m = route_metrics(route)
-                            if route:
-                                ga_rows.append({
-                                    "Araç": f"Araç {i+1}",
-                                    "Müşteri": m["customers"],
-                                    "Süre (dk)": round(m["time"], 1),
-                                    "Mesafe (km)": round(m["km"], 2),
-                                    "Yük (desi)": round(m["load"], 0),
-                                    "Enerji (kWh)": round(m["energy"], 2),
-                                })
-
-                        st.markdown("**Özet**")
-                        if ga_rows:
-                            gdf = pd.DataFrame(ga_rows)
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                st.metric("Toplam Mesafe", f"{gdf['Mesafe (km)'].sum():.2f} km")
-                                st.metric("Toplam Süre", f"{gdf['Süre (dk)'].sum():.1f} dk")
-                            with c2:
-                                st.metric("Toplam Yük", f"{gdf['Yük (desi)'].sum():.0f} desi")
-                                st.metric("Toplam Enerji", f"{gdf['Enerji (kWh)'].sum():.2f} kWh")
-                            st.dataframe(gdf, use_container_width=True)
-                        else:
-                            st.info("Seçili araçlarda GA rota yok.")
-
-                    st.markdown("### 📊 Tabu vs GA Fark Özeti (Seçili Araçlar)")
-                    tabu_total = {"km": 0.0, "time": 0.0, "load": 0.0, "energy": 0.0}
-                    ga_total = {"km": 0.0, "time": 0.0, "load": 0.0, "energy": 0.0}
-                    for i in selected_vehicles:
-                        tm = route_metrics(tabu_routes[i] if i < len(tabu_routes) else [])
-                        gm = route_metrics(ga_routes[i] if i < len(ga_routes) else [])
-                        for k in tabu_total:
-                            tabu_total[k] += tm[k]
-                            ga_total[k] += gm[k]
-
-                    d1, d2, d3, d4 = st.columns(4)
-                    with d1:
-                        st.metric("Mesafe Farkı (GA-Tabu)", f"{ga_total['km'] - tabu_total['km']:.2f} km")
-                    with d2:
-                        st.metric("Süre Farkı (GA-Tabu)", f"{ga_total['time'] - tabu_total['time']:.1f} dk")
-                    with d3:
-                        st.metric("Yük Farkı (GA-Tabu)", f"{ga_total['load'] - tabu_total['load']:.0f} desi")
-                    with d4:
-                        st.metric("Enerji Farkı (GA-Tabu)", f"{ga_total['energy'] - tabu_total['energy']:.2f} kWh")
+                    if totals_rows:
+                        st.markdown("### 📊 Seçili Çözümler Toplam Karşılaştırma")
+                        st.dataframe(pd.DataFrame(totals_rows), use_container_width=True)
 
             elif has_tabu:
                 # Only Tabu available
@@ -2089,7 +2324,7 @@ with tab6:
                                     "selected_weekday"),
                             )
 
-                        st_folium(m, width=1200, height=800)
+                        render_folium_safe(m, width=1200, height=800)
 
                         # Statistics table
                         st.markdown("---")
@@ -2210,7 +2445,7 @@ with tab6:
                         osrm_client=osrm_client,
                         weekday=st.session_state.get("selected_weekday"),
                     )
-                    st_folium(m_ga, width=1200, height=800)
+                    render_folium_safe(m_ga, width=1200, height=800)
 
                 # GA Statistics
                 st.markdown("---")
@@ -2318,7 +2553,6 @@ with tab7:
     tabu_ran = tabu_result is not None
     has_tabu = tabu_result is not None and tabu_result.get("solution") is not None
     has_ga = ga_routes is not None
-
     if data is None:
         st.warning("⚠️ Önce EVRP modelini oluşturun.")
     elif not has_tabu and not has_ga:
@@ -2613,6 +2847,20 @@ with tab7:
                 original_vehicle_options = [f"Araç {i + 1}" for i in range(len(saved_original))]
                 multitrip_vehicle_options = [f"Araç {v['vehicle_id']}" for v in saved_assignments]
 
+                btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+                with btn_col1:
+                    if st.button("Orijinal: Tümünü Seç", key="multitrip_original_select_all"):
+                        st.session_state["multitrip_original_vehicle_filter"] = original_vehicle_options
+                with btn_col2:
+                    if st.button("Orijinal: Tümünü Kaldır", key="multitrip_original_clear_all"):
+                        st.session_state["multitrip_original_vehicle_filter"] = []
+                with btn_col3:
+                    if st.button("Multi-Trip: Tümünü Seç", key="multitrip_select_all"):
+                        st.session_state["multitrip_vehicle_filter"] = multitrip_vehicle_options
+                with btn_col4:
+                    if st.button("Multi-Trip: Tümünü Kaldır", key="multitrip_clear_all"):
+                        st.session_state["multitrip_vehicle_filter"] = []
+
                 filter_col1, filter_col2 = st.columns(2)
                 with filter_col1:
                     selected_original_vehicles = st.multiselect(
@@ -2673,7 +2921,7 @@ with tab7:
                             osrm_client=osrm_client,
                             weekday=st.session_state.get("selected_weekday"),
                         )
-                        st_folium(m_original, width=550, height=500, key="multitrip_original_map_readded")
+                        render_folium_safe(m_original, width=550, height=500, key="multitrip_original_map_readded")
                     else:
                         st.info("Orijinal rota bulunamadı.")
 
@@ -2694,6 +2942,6 @@ with tab7:
                             weekday=st.session_state.get("selected_weekday"),
                             route_labels=multitrip_labels,
                         )
-                        st_folium(m_multi, width=550, height=500, key="multitrip_optimized_map_readded")
+                        render_folium_safe(m_multi, width=550, height=500, key="multitrip_optimized_map_readded")
                     else:
                         st.info("Multi-trip rota bulunamadı.")
