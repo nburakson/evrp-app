@@ -445,3 +445,427 @@ def solve_multitrip_alns_mip(
             "mip_applied": bool(polished),
         },
     }
+
+
+def solve_multitrip_tabu_mip(
+    jobs: List[Dict[str, Any]],
+    max_shift_duration: float,
+    usable_energy: float,
+    depot_service_time: float,
+    battery_capacity: float,
+    iterations: int = 400,
+    tabu_tenure: int = 20,
+    seed: int = 42,
+    mip_time_limit_s: int = 5,
+) -> Dict[str, Any]:
+    """Multi-trip assignment optimization with Tabu Search + MIP polishing."""
+    rng = random.Random(int(seed))
+
+    candidate_jobs: List[_Job] = []
+    dropped_jobs: List[Dict[str, Any]] = []
+
+    for i, raw in enumerate(jobs):
+        t = float(raw.get("time_min", 0.0))
+        e = float(raw.get("energy_kwh", 0.0))
+        d = float(raw.get("distance_km", 0.0))
+        l = float(raw.get("load_desi", 0.0))
+
+        if t > max_shift_duration + 1e-9 or e > usable_energy + 1e-9:
+            dropped_jobs.append(dict(raw))
+            continue
+
+        candidate_jobs.append(
+            _Job(
+                idx=i,
+                time_min=t,
+                energy_kwh=e,
+                distance_km=d,
+                load_desi=l,
+                payload=dict(raw),
+            )
+        )
+
+    log_lines: List[str] = []
+    log_lines.append("Tabu + MIP multi-trip optimizasyonu başlatıldı.")
+    log_lines.append(f"Toplam iş: {len(jobs)} | Uygun iş: {len(candidate_jobs)} | Hariç tutulan: {len(dropped_jobs)}")
+
+    if not candidate_jobs:
+        return {
+            "assignments": [],
+            "dropped_jobs": dropped_jobs,
+            "log": "\n".join(log_lines + ["Uygun iş yok; çözüm üretilemedi."]),
+            "stats": {"used_vehicles": 0, "score": 0.0, "mip_applied": False},
+        }
+
+    current = _build_greedy_initial(
+        jobs=candidate_jobs,
+        max_shift_duration=max_shift_duration,
+        usable_energy=usable_energy,
+        depot_service_time=depot_service_time,
+    )
+    best = _deepcopy_assignment(current)
+    best_score = _score_solution(best, depot_service_time)
+    log_lines.append(f"Başlangıç (greedy) araç sayısı: {len(best)}")
+
+    tabu_until: Dict[Tuple[int, int, int], int] = {}
+    iters = max(1, int(iterations))
+    tenure = max(2, int(tabu_tenure))
+
+    for it in range(iters):
+        best_cand = None
+        best_cand_score = float("inf")
+        best_move_key = None
+
+        trials = max(12, 3 * max(1, len(candidate_jobs)))
+        for _ in range(trials):
+            if not current:
+                break
+            cand = _deepcopy_assignment(current)
+
+            if len(cand) >= 2 and rng.random() < 0.65:
+                src = rng.randrange(len(cand))
+                if not cand[src]:
+                    continue
+                jpos = rng.randrange(len(cand[src]))
+                job = cand[src].pop(jpos)
+
+                if not cand[src]:
+                    cand.pop(src)
+                if not cand:
+                    cand = [[job]]
+                    move_key = (job.idx, src, 0)
+                else:
+                    dst = rng.randrange(len(cand))
+                    cand[dst].append(job)
+                    move_key = (job.idx, src, dst)
+
+                cand = _cleanup_empty_vehicles(cand)
+                if any(not _is_feasible_vehicle(v, max_shift_duration, usable_energy, depot_service_time) for v in cand):
+                    continue
+            else:
+                if len(cand) < 2:
+                    continue
+                v1, v2 = rng.sample(range(len(cand)), 2)
+                if not cand[v1] or not cand[v2]:
+                    continue
+                j1 = rng.randrange(len(cand[v1]))
+                j2 = rng.randrange(len(cand[v2]))
+                cand[v1][j1], cand[v2][j2] = cand[v2][j2], cand[v1][j1]
+                move_key = (cand[v1][j1].idx, v1, v2)
+
+                if not _is_feasible_vehicle(cand[v1], max_shift_duration, usable_energy, depot_service_time):
+                    continue
+                if not _is_feasible_vehicle(cand[v2], max_shift_duration, usable_energy, depot_service_time):
+                    continue
+
+            cand_score = _score_solution(cand, depot_service_time)
+            is_tabu = tabu_until.get(move_key, -1) > it
+            aspiration = cand_score < best_score
+            if is_tabu and not aspiration:
+                continue
+
+            if cand_score < best_cand_score:
+                best_cand = cand
+                best_cand_score = cand_score
+                best_move_key = move_key
+
+        if best_cand is None:
+            # Diversification step
+            cand = _deepcopy_assignment(current)
+            cand, removed = _random_destroy(cand, destroy_count=max(1, len(candidate_jobs) // 10), rng=rng)
+            cand = _repair_best_insertion(
+                assignment=cand,
+                removed_jobs=removed,
+                max_shift_duration=max_shift_duration,
+                usable_energy=usable_energy,
+                depot_service_time=depot_service_time,
+            )
+            current = cand
+        else:
+            current = best_cand
+            if best_move_key is not None:
+                tabu_until[best_move_key] = it + tenure
+
+        cur_score = _score_solution(current, depot_service_time)
+        if cur_score < best_score:
+            best = _deepcopy_assignment(current)
+            best_score = cur_score
+
+    log_lines.append(f"Tabu sonrası araç sayısı: {len(best)}")
+
+    polished, mip_msg = _mip_polish(
+        jobs=candidate_jobs,
+        max_shift_duration=max_shift_duration,
+        usable_energy=usable_energy,
+        depot_service_time=depot_service_time,
+        max_vehicles=len(best),
+        time_limit_s=int(mip_time_limit_s),
+    )
+    log_lines.append(mip_msg)
+
+    final_assignment = polished if polished else best
+    final_score = _score_solution(final_assignment, depot_service_time)
+
+    assignments: List[Dict[str, Any]] = []
+    for vid, vjobs in enumerate(final_assignment, start=1):
+        t, e, d, l = _vehicle_metrics(vjobs, depot_service_time)
+        payload_jobs = [dict(j.payload) for j in vjobs]
+        assignments.append(
+            {
+                "vehicle_id": vid,
+                "jobs": payload_jobs,
+                "num_trips": len(payload_jobs),
+                "time_min": t,
+                "distance_km": d,
+                "load_desi": l,
+                "energy_kwh": e,
+                "remaining_energy_kwh": max(0.0, battery_capacity - e),
+            }
+        )
+
+    log_lines.append(f"Nihai araç sayısı: {len(assignments)}")
+    log_lines.append("Tabu + MIP optimizasyonu tamamlandı.")
+
+    return {
+        "assignments": assignments,
+        "dropped_jobs": dropped_jobs,
+        "log": "\n".join(log_lines),
+        "stats": {
+            "used_vehicles": len(assignments),
+            "score": final_score,
+            "mip_applied": bool(polished),
+        },
+    }
+
+
+def solve_multitrip_ga_mip(
+    jobs: List[Dict[str, Any]],
+    max_shift_duration: float,
+    usable_energy: float,
+    depot_service_time: float,
+    battery_capacity: float,
+    iterations: int = 250,
+    mutation_rate: float = 0.20,
+    seed: int = 42,
+    mip_time_limit_s: int = 5,
+    population_size: int = 30,
+) -> Dict[str, Any]:
+    """Multi-trip assignment optimization with GA + MIP polishing."""
+    rng = random.Random(int(seed))
+
+    candidate_jobs: List[_Job] = []
+    dropped_jobs: List[Dict[str, Any]] = []
+
+    for i, raw in enumerate(jobs):
+        t = float(raw.get("time_min", 0.0))
+        e = float(raw.get("energy_kwh", 0.0))
+        d = float(raw.get("distance_km", 0.0))
+        l = float(raw.get("load_desi", 0.0))
+
+        if t > max_shift_duration + 1e-9 or e > usable_energy + 1e-9:
+            dropped_jobs.append(dict(raw))
+            continue
+
+        candidate_jobs.append(
+            _Job(
+                idx=i,
+                time_min=t,
+                energy_kwh=e,
+                distance_km=d,
+                load_desi=l,
+                payload=dict(raw),
+            )
+        )
+
+    log_lines: List[str] = []
+    log_lines.append("GA + MIP multi-trip optimizasyonu başlatıldı.")
+    log_lines.append(f"Toplam iş: {len(jobs)} | Uygun iş: {len(candidate_jobs)} | Hariç tutulan: {len(dropped_jobs)}")
+
+    if not candidate_jobs:
+        return {
+            "assignments": [],
+            "dropped_jobs": dropped_jobs,
+            "log": "\n".join(log_lines + ["Uygun iş yok; çözüm üretilemedi."]),
+            "stats": {"used_vehicles": 0, "score": 0.0, "mip_applied": False},
+        }
+
+    def _randomized_initial() -> List[List[_Job]]:
+        asg: List[List[_Job]] = []
+        ordered = list(candidate_jobs)
+        rng.shuffle(ordered)
+        for job in ordered:
+            feasible_slots = []
+            for vidx, veh in enumerate(asg):
+                cand = veh + [job]
+                if _is_feasible_vehicle(cand, max_shift_duration, usable_energy, depot_service_time):
+                    feasible_slots.append(vidx)
+
+            if feasible_slots:
+                asg[rng.choice(feasible_slots)].append(job)
+            else:
+                asg.append([job])
+        return _cleanup_empty_vehicles(asg)
+
+    def _repair_full(assignment: List[List[_Job]]) -> List[List[_Job]]:
+        seen = set()
+        clean: List[List[_Job]] = []
+        dupes: List[_Job] = []
+        for v in assignment:
+            vv: List[_Job] = []
+            for j in v:
+                if j.idx in seen:
+                    dupes.append(j)
+                    continue
+                seen.add(j.idx)
+                vv.append(j)
+            if vv:
+                clean.append(vv)
+
+        missing = [j for j in candidate_jobs if j.idx not in seen]
+        pool = dupes + missing
+        return _repair_best_insertion(
+            assignment=clean,
+            removed_jobs=pool,
+            max_shift_duration=max_shift_duration,
+            usable_energy=usable_energy,
+            depot_service_time=depot_service_time,
+        )
+
+    def _crossover(a: List[List[_Job]], b: List[List[_Job]]) -> List[List[_Job]]:
+        child: List[List[_Job]] = []
+        used = set()
+
+        parents = [a, b]
+        rng.shuffle(parents)
+        for p in parents:
+            for v in p:
+                if not v:
+                    continue
+                if rng.random() > 0.45:
+                    continue
+                cand = [j for j in v if j.idx not in used]
+                if not cand:
+                    continue
+                if _is_feasible_vehicle(cand, max_shift_duration, usable_energy, depot_service_time):
+                    child.append(cand)
+                    used.update(j.idx for j in cand)
+
+        remaining = [j for j in candidate_jobs if j.idx not in used]
+        child = _repair_best_insertion(
+            assignment=child,
+            removed_jobs=remaining,
+            max_shift_duration=max_shift_duration,
+            usable_energy=usable_energy,
+            depot_service_time=depot_service_time,
+        )
+        return _repair_full(child)
+
+    def _mutate(assignment: List[List[_Job]]) -> List[List[_Job]]:
+        cand = _deepcopy_assignment(assignment)
+        if rng.random() < 0.5:
+            cand = _try_random_swap(
+                assignment=cand,
+                max_shift_duration=max_shift_duration,
+                usable_energy=usable_energy,
+                depot_service_time=depot_service_time,
+                rng=rng,
+            )
+        else:
+            cand, removed = _random_destroy(cand, destroy_count=max(1, len(candidate_jobs) // 12), rng=rng)
+            cand = _repair_best_insertion(
+                assignment=cand,
+                removed_jobs=removed,
+                max_shift_duration=max_shift_duration,
+                usable_energy=usable_energy,
+                depot_service_time=depot_service_time,
+            )
+        return _repair_full(cand)
+
+    pop_size = max(8, int(population_size))
+    generations = max(1, int(iterations))
+    mut = max(0.01, min(0.8, float(mutation_rate)))
+
+    population: List[List[List[_Job]]] = [_build_greedy_initial(candidate_jobs, max_shift_duration, usable_energy, depot_service_time)]
+    for _ in range(pop_size - 1):
+        population.append(_randomized_initial())
+
+    def _fitness(asg: List[List[_Job]]) -> float:
+        return _score_solution(_repair_full(asg), depot_service_time)
+
+    best = min(population, key=_fitness)
+    best_score = _fitness(best)
+    log_lines.append(f"Başlangıç en iyi araç sayısı: {len(_cleanup_empty_vehicles(best))}")
+
+    for _ in range(generations):
+        ranked = sorted(population, key=_fitness)
+        elite_count = max(2, pop_size // 5)
+        new_pop = [
+            _repair_full(_deepcopy_assignment(ind))
+            for ind in ranked[:elite_count]
+        ]
+
+        def _pick_parent() -> List[List[_Job]]:
+            contenders = rng.sample(ranked[: max(elite_count * 2, 4)], k=min(3, len(ranked[: max(elite_count * 2, 4)])))
+            return min(contenders, key=_fitness)
+
+        while len(new_pop) < pop_size:
+            p1 = _pick_parent()
+            p2 = _pick_parent()
+            child = _crossover(p1, p2)
+            if rng.random() < mut:
+                child = _mutate(child)
+            new_pop.append(_repair_full(child))
+
+        population = new_pop
+        gen_best = min(population, key=_fitness)
+        gen_score = _fitness(gen_best)
+        if gen_score < best_score:
+            best = _deepcopy_assignment(gen_best)
+            best_score = gen_score
+
+    best = _cleanup_empty_vehicles(_repair_full(best))
+    log_lines.append(f"GA sonrası araç sayısı: {len(best)}")
+
+    polished, mip_msg = _mip_polish(
+        jobs=candidate_jobs,
+        max_shift_duration=max_shift_duration,
+        usable_energy=usable_energy,
+        depot_service_time=depot_service_time,
+        max_vehicles=len(best),
+        time_limit_s=int(mip_time_limit_s),
+    )
+    log_lines.append(mip_msg)
+
+    final_assignment = polished if polished else best
+    final_score = _score_solution(final_assignment, depot_service_time)
+
+    assignments: List[Dict[str, Any]] = []
+    for vid, vjobs in enumerate(final_assignment, start=1):
+        t, e, d, l = _vehicle_metrics(vjobs, depot_service_time)
+        payload_jobs = [dict(j.payload) for j in vjobs]
+        assignments.append(
+            {
+                "vehicle_id": vid,
+                "jobs": payload_jobs,
+                "num_trips": len(payload_jobs),
+                "time_min": t,
+                "distance_km": d,
+                "load_desi": l,
+                "energy_kwh": e,
+                "remaining_energy_kwh": max(0.0, battery_capacity - e),
+            }
+        )
+
+    log_lines.append(f"Nihai araç sayısı: {len(assignments)}")
+    log_lines.append("GA + MIP optimizasyonu tamamlandı.")
+
+    return {
+        "assignments": assignments,
+        "dropped_jobs": dropped_jobs,
+        "log": "\n".join(log_lines),
+        "stats": {
+            "used_vehicles": len(assignments),
+            "score": final_score,
+            "mip_applied": bool(polished),
+        },
+    }
