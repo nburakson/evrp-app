@@ -41,6 +41,7 @@ import re
 import json
 import numpy as np
 import matplotlib.colors as mcolors
+import hashlib
 from folium.plugins import BeautifyIcon
 from dataclasses import dataclass
 
@@ -116,9 +117,17 @@ if "osrm_T" not in st.session_state:
 
 # cached structures for optimization
 for key in ["evrp_problem", "ortools_data", "tabu_result",
-            "ortools_routes", "ga_best_routes", "ga_best_fitness"]:
+            "ortools_routes", "ga_best_routes", "ga_best_fitness",
+            "alns_result", "alns_routes"]:
     if key not in st.session_state:
         st.session_state[key] = None
+
+if "one_trip_cache" not in st.session_state:
+    st.session_state["one_trip_cache"] = {}
+
+for k in ["tabu_runtime_s", "ga_runtime_s", "alns_runtime_s", "one_trip_signature"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 # =========================================================
 # CONSTANTS
@@ -453,6 +462,25 @@ def extract_routes_from_solution(data, routing, manager, solution):
     return routes
 
 
+def one_trip_signature(data: dict | None) -> str | None:
+    """Create a stable signature for caching one-trip solutions."""
+    if data is None:
+        return None
+
+    h = hashlib.md5()
+    h.update(str(data.get("num_vehicles", "")).encode("utf-8"))
+    h.update(str(data.get("vehicle_cap_desi", "")).encode("utf-8"))
+    h.update(str(data.get("battery_capacity", data.get("battery_kwh", ""))).encode("utf-8"))
+    h.update(str(data.get("depot", 0)).encode("utf-8"))
+
+    for key in ["distance_km", "time_min", "demand_desi", "service_min"]:
+        arr = np.array(data.get(key, []), dtype=float)
+        h.update(str(arr.shape).encode("utf-8"))
+        h.update(np.round(arr, 3).tobytes())
+
+    return h.hexdigest()
+
+
 # =========================================================
 # ⚡ ADVANCED EVRP FEASIBILITY ANALYZER
 # =========================================================
@@ -600,7 +628,7 @@ def evrp_feasibility_detailed(data, work_start_min=9*60, work_end_min=18*60):
 # =========================================================
 # MAIN TABS (Adres / Orders / Map / OSRM)
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     [
         "1️⃣ Adres → Koordinat",
         "2️⃣ Sipariş Oluştur",
@@ -609,6 +637,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         "5️⃣ Trafikli Süre Matrisleri",
         "6️⃣ Problem Çözümü",
         "7️⃣ Çoklu Görev Optimizasyonu",
+        "8️⃣ Sonuç Gösterimi",
     ]
 )
 
@@ -1239,12 +1268,21 @@ with tab5:
 with tab6:
     st.header("📦 Problem Çözümü")
 
+    current_sig = one_trip_signature(st.session_state.get("ortools_data"))
+    prev_sig = st.session_state.get("one_trip_signature")
+    if current_sig != prev_sig:
+        st.session_state["one_trip_cache"] = {}
+        st.session_state["one_trip_signature"] = current_sig
+        st.session_state["tabu_runtime_s"] = None
+        st.session_state["ga_runtime_s"] = None
+        st.session_state["alns_runtime_s"] = None
+
     evrp_tab1, evrp_tab2, evrp_tab3, evrp_tab4, evrp_tab5 = st.tabs(
         [
             "📦 Problem Kurulumu",
             "🧠 Tabu Search",
             "🧬 Genetik Algoritma",
-            "🚛 Multi-Trip",
+            "🧩 ALNS",
             "🗺 Çözümü Haritada Göster",
         ]
     )
@@ -1337,6 +1375,8 @@ with tab6:
         st.session_state["ortools_routes"] = None
         st.session_state["ga_best_routes"] = None
         st.session_state["ga_best_fitness"] = None
+        st.session_state["alns_result"] = None
+        st.session_state["alns_routes"] = None
 
         st.success("EVRP modeli başarıyla oluşturuldu.")
         st.subheader("🧪 Detaylı Feasibility Analizi")
@@ -1473,17 +1513,30 @@ with tab6:
 
             if st.button("🚀 Çöz", key="evrp_tab2_run_solver"):
                 import time
-                start_time = time.time()
+                sig = st.session_state.get("one_trip_signature")
+                cache_key = ("tabu", sig, int(time_limit), int(seed))
+                cached = st.session_state["one_trip_cache"].get(cache_key)
 
-                with st.spinner("Tabu Search solver çalışıyor..."):
-                    result = solve_with_ortools_tabu(
-                        data,
-                        time_limit_s=int(time_limit),
-                        seed=int(seed),
-                    )
+                if cached is not None:
+                    result = cached["result"]
+                    elapsed = float(cached["elapsed_s"])
+                    st.info(f"Önbellekten yüklendi (Tabu, {elapsed:.1f} sn).")
+                else:
+                    start_time = time.time()
+                    with st.spinner("Tabu Search solver çalışıyor..."):
+                        result = solve_with_ortools_tabu(
+                            data,
+                            time_limit_s=int(time_limit),
+                            seed=int(seed),
+                        )
+                    elapsed = time.time() - start_time
+                    st.session_state["one_trip_cache"][cache_key] = {
+                        "result": result,
+                        "elapsed_s": elapsed,
+                    }
 
-                elapsed = time.time() - start_time
                 st.session_state["tabu_result"] = result
+                st.session_state["tabu_runtime_s"] = elapsed
                 st.session_state["solver_mode"] = "Tek Tur (Tabu)"
                 st.session_state["tab6_multitrip_used"] = False
 
@@ -1596,6 +1649,19 @@ with tab6:
                 )
 
             if st.button("🧬 GA Çalıştır", key="evrp_tab3_run_ga"):
+                sig = st.session_state.get("one_trip_signature")
+                ga_cache_key = (
+                    "ga",
+                    sig,
+                    int(pop_size),
+                    int(generations),
+                    float(mutation_rate),
+                    int(ga_seed),
+                    str(objective),
+                    str(improvement_mode),
+                )
+                cached_ga = st.session_state["one_trip_cache"].get(ga_cache_key)
+
                 # GA always starts from scratch - completely independent from Tabu
                 st.markdown(
                     "### 📊 GA Başlangıç: Tüm Müşteriler (Bağımsız Çözüm)")
@@ -1636,26 +1702,39 @@ with tab6:
 
                 st.markdown("---")
 
-                with st.spinner(f"Genetik Algoritma çalışıyor ({generations} generasyon)..."):
-                    import time
-                    start_time = time.time()
+                if cached_ga is not None:
+                    best_routes = cached_ga["best_routes"]
+                    best_fit = float(cached_ga["best_fit"])
+                    ga_time = float(cached_ga["ga_time"])
+                    st.info(f"Önbellekten yüklendi (GA, {ga_time:.1f} sn).")
+                else:
+                    with st.spinner(f"Genetik Algoritma çalışıyor ({generations} generasyon)..."):
+                        import time
+                        start_time = time.time()
 
-                    best_routes, best_fit = ga_optimize_sequences(
-                        data=data,
-                        base_routes=base_routes,
-                        pop_size=int(pop_size),
-                        generations=int(generations),
-                        objective=objective,
-                        elitism=2,
-                        seed=int(ga_seed),
-                        improvement_mode=improvement_mode
-                    )
+                        best_routes, best_fit = ga_optimize_sequences(
+                            data=data,
+                            base_routes=base_routes,
+                            pop_size=int(pop_size),
+                            generations=int(generations),
+                            objective=objective,
+                            elitism=2,
+                            seed=int(ga_seed),
+                            improvement_mode=improvement_mode
+                        )
 
-                    ga_time = time.time() - start_time
+                        ga_time = time.time() - start_time
+
+                    st.session_state["one_trip_cache"][ga_cache_key] = {
+                        "best_routes": best_routes,
+                        "best_fit": best_fit,
+                        "ga_time": ga_time,
+                    }
 
                 st.session_state["ga_best_routes"] = best_routes
                 st.session_state["ga_best_fitness"] = best_fit
                 st.session_state["ga_original_cost"] = original_cost
+                st.session_state["ga_runtime_s"] = ga_time
 
                 improvement = (
                     (original_cost - best_fit) / original_cost * 100
@@ -1728,231 +1807,109 @@ with tab6:
 
                 st.text_area("GA Detaylı Çıktı", txt_ga, height=600)
 
-    # ---------- TAB 4: Multi-Trip (Independent ALNS+MIP) ----------
+    # ---------- TAB 4: ALNS Single-Trip ----------
     with evrp_tab4:
-        st.subheader("🚛 Multi-Trip (ALNS + MIP)")
+        st.subheader("🧩 ALNS Çözücü (Tek Tur)")
 
         data = st.session_state.get("ortools_data")
 
         if data is None:
             st.warning("Önce EVRP modelini oluşturun.")
         else:
-            from utils.alns_multitrip_solver import solve_multitrip_alns_mip
-            from utils.multitrip_solver import solve_multitrip_ortools
+            from utils.alns_singletrip_solver import solve_with_alns_singletrip
 
-            D = np.array(data["distance_km"], dtype=float)
-            T = np.array(data["time_min"], dtype=float)
-            loads = np.array(data["demand_desi"], dtype=float)
-            service = np.array(data.get("service_min", np.zeros(len(loads))), dtype=float)
-            depot = int(data.get("depot", 0))
-            battery_capacity = float(data.get("battery_capacity", 100.0))
+            st.caption("Tabu/GA ile aynı EVRP kısıtlarını (kapasite, vardiya, batarya) kullanarak rota üretir.")
 
-            st.markdown("### Bağımsız Multi-Trip Çözümü (ALNS + MIP)")
-            st.caption("Bu sekmede bağımsız multi-trip çözümü ALNS ile üretilir ve MIP polishing ile iyileştirilir.")
-
-            mtc1, mtc2 = st.columns(2)
-            with mtc1:
-                mt_time_limit = st.number_input(
-                    "Multi-Trip zaman limiti (saniye)",
-                    min_value=1,
-                    value=20,
-                    key="tab6_mt_direct_time_limit",
-                )
-            with mtc2:
-                mt_seed = st.number_input(
-                    "Multi-Trip random seed",
-                    min_value=0,
-                    value=42,
-                    key="tab6_mt_direct_seed",
-                )
-
-            a1, a2, a3 = st.columns(3)
-            with a1:
+            ac1, ac2, ac3, ac4 = st.columns(4)
+            with ac1:
                 alns_iterations = st.number_input(
                     "ALNS iterasyon",
                     min_value=50,
                     max_value=5000,
-                    value=400,
+                    value=600,
                     step=50,
-                    key="tab6_mt_direct_alns_iterations",
+                    key="tab6_alns_iterations",
                 )
-            with a2:
+            with ac2:
                 alns_destroy_rate = st.slider(
-                    "ALNS destroy oranı",
-                    min_value=0.10,
+                    "Destroy oranı",
+                    min_value=0.05,
                     max_value=0.60,
-                    value=0.25,
+                    value=0.20,
                     step=0.05,
-                    key="tab6_mt_direct_alns_destroy_rate",
+                    key="tab6_alns_destroy_rate",
                 )
-            with a3:
-                mip_time_limit = st.number_input(
-                    "MIP polishing süre limiti (sn)",
-                    min_value=1,
-                    max_value=30,
-                    value=5,
-                    step=1,
-                    key="tab6_mt_direct_mip_time_limit",
-                )
-
-            c1, c2 = st.columns(2)
-            with c1:
-                max_shift_duration = st.number_input(
-                    "Maksimum vardiya süresi (dk)",
-                    min_value=240,
-                    max_value=720,
-                    value=540,
-                    step=30,
-                    key="tab6_mt_direct_max_shift",
-                )
-            with c2:
-                min_return_pct = st.number_input(
-                    "Minimum dönüş şarjı (%)",
+            with ac3:
+                alns_seed = st.number_input(
+                    "Random seed",
                     min_value=0,
-                    max_value=90,
-                    value=20,
-                    step=5,
-                    key="tab6_mt_direct_min_return_pct",
+                    value=42,
+                    key="tab6_alns_seed",
+                )
+            with ac4:
+                alns_objective = st.selectbox(
+                    "Amaç fonksiyonu",
+                    ["distance", "energy"],
+                    index=0,
+                    key="tab6_alns_objective",
                 )
 
-            depot_service_time = st.number_input(
-                "Depo servis süresi (dk)",
-                min_value=0,
-                max_value=60,
-                value=15,
-                step=5,
-                key="tab6_mt_direct_depot_service",
-            )
+            if st.button("🧩 ALNS Çalıştır", key="evrp_tab4_run_alns"):
+                import time
+                sig = st.session_state.get("one_trip_signature")
+                alns_cache_key = (
+                    "alns",
+                    sig,
+                    int(alns_iterations),
+                    float(alns_destroy_rate),
+                    int(alns_seed),
+                    str(alns_objective),
+                )
+                cached_alns = st.session_state["one_trip_cache"].get(alns_cache_key)
 
-            usable_energy = battery_capacity * (1.0 - float(min_return_pct) / 100.0)
-            st.caption(
-                f"Toplam batarya: {battery_capacity:.2f} kWh | Kullanılabilir enerji: {usable_energy:.2f} kWh"
-            )
-
-            if st.button("🚀 Bağımsız Multi-Trip Çöz", key="tab6_mt_direct_run"):
-                with st.spinner("Bağımsız Multi-Trip solver çalışıyor..."):
-                    mt_result = solve_multitrip_ortools(
-                        data,
-                        time_limit_s=int(mt_time_limit),
-                        seed=int(mt_seed),
-                        allow_multi_trip=True,
-                    )
-
-                st.session_state["multitrip_direct_result"] = mt_result
-
-                if mt_result.get("solution") is not None:
-                    mt_routes = extract_routes_from_solution(
-                        data,
-                        mt_result["routing"],
-                        mt_result["manager"],
-                        mt_result["solution"],
-                    )
-
-                    original_jobs = []
-                    for i, route in enumerate(mt_routes):
-                        if not route:
-                            continue
-                        total_km = 0.0
-                        total_time = 0.0
-                        total_load = 0.0
-                        total_energy = 0.0
-                        prev = depot
-                        cum_load = 0.0
-
-                        for node in route:
-                            if node < 0 or node >= len(loads):
-                                continue
-                            d_km = float(D[prev, node])
-                            t_min = float(T[prev, node])
-                            total_km += d_km
-                            total_time += t_min + float(service[node])
-                            total_energy += 0.436 * d_km + 0.002 * cum_load
-                            node_load = float(loads[node])
-                            cum_load += node_load
-                            total_load += node_load
-                            prev = node
-
-                        d_km = float(D[prev, depot])
-                        t_min = float(T[prev, depot])
-                        total_km += d_km
-                        total_time += t_min
-                        total_energy += 0.436 * d_km + 0.002 * cum_load
-
-                        original_jobs.append({
-                            "job_id": i + 1,
-                            "route": route,
-                            "time_min": total_time,
-                            "distance_km": total_km,
-                            "load_desi": total_load,
-                            "energy_kwh": total_energy,
-                        })
-
-                    with st.spinner("ALNS + MIP polishing ile atama iyileştiriliyor..."):
-                        alns_result = solve_multitrip_alns_mip(
-                            jobs=original_jobs,
-                            max_shift_duration=float(max_shift_duration),
-                            usable_energy=float(usable_energy),
-                            depot_service_time=float(depot_service_time),
-                            battery_capacity=float(battery_capacity),
+                if cached_alns is not None:
+                    alns_result = cached_alns["result"]
+                    alns_elapsed = float(cached_alns["elapsed_s"])
+                    st.info(f"Önbellekten yüklendi (ALNS, {alns_elapsed:.1f} sn).")
+                else:
+                    start_time = time.time()
+                    with st.spinner("ALNS solver çalışıyor..."):
+                        alns_result = solve_with_alns_singletrip(
+                            data=data,
                             iterations=int(alns_iterations),
                             destroy_rate=float(alns_destroy_rate),
-                            seed=int(mt_seed),
-                            mip_time_limit_s=int(mip_time_limit),
+                            seed=int(alns_seed),
+                            objective=str(alns_objective),
                         )
+                    alns_elapsed = time.time() - start_time
+                    st.session_state["one_trip_cache"][alns_cache_key] = {
+                        "result": alns_result,
+                        "elapsed_s": alns_elapsed,
+                    }
 
-                    vehicle_assignments = alns_result.get("assignments", [])
-                    dropped_jobs = alns_result.get("dropped_jobs", [])
+                alns_routes = alns_result.get("routes", [])
+                st.session_state["alns_result"] = alns_result
+                st.session_state["alns_routes"] = alns_routes
+                st.session_state["alns_runtime_s"] = alns_elapsed
 
-                    st.session_state["multitrip_assignments"] = vehicle_assignments
-                    st.session_state["multitrip_original_jobs"] = original_jobs
-                    st.session_state["multitrip_base_solution"] = "Tab6 Independent ALNS+MIP"
-                    st.session_state["tab6_multitrip_used"] = True
+                served = int(alns_result.get("served_customers", 0))
+                n_customers = max(0, data["distance_km"].shape[0] - 1)
+                unserved = alns_result.get("unserved_customers", [])
 
-                    if dropped_jobs:
-                        st.warning(
-                            f"{len(dropped_jobs)} rota zaman/enerji sınırını tek başına aştığı için atamaya dahil edilmedi."
-                        )
-
-                    served_mt = sum(len(r) for r in mt_routes)
-                    st.success(
-                        f"Bağımsız Multi-Trip çözümü üretildi. {served_mt} müşteri servis edildi. "
-                        f"ALNS + MIP sonrası araç sayısı: {len(vehicle_assignments)}"
-                    )
-                    st.text_area(
-                        "ALNS + MIP Log",
-                        value=alns_result.get("log", ""),
-                        height=220,
-                        key="tab6_mt_direct_alns_log",
+                if unserved:
+                    st.warning(
+                        f"ALNS çözümü tamamlandı. {served}/{n_customers} müşteri servis edildi. "
+                        f"Servis edilemeyen: {unserved[:20]}"
                     )
                 else:
-                    st.error("Bağımsız Multi-Trip çözümü bulunamadı.")
+                    st.success(f"ALNS çözümü bulundu. {served}/{n_customers} müşteri servis edildi. (⏱️ {alns_elapsed:.1f} sn)")
 
                 st.text_area(
-                    "Bağımsız Multi-Trip Çözücü Log",
-                    value=mt_result.get("log", ""),
+                    "ALNS Log",
+                    value=alns_result.get("log", ""),
                     height=240,
-                    key="tab6_mt_direct_log",
+                    key="evrp_tab4_alns_log",
                 )
-
-            st.markdown("---")
-            st.info("Tabu/GA sonrası Multi-Trip optimizasyonu için 7️⃣ Çoklu Görev Optimizasyonu sekmesini kullanın.")
-
-            saved_assignments = st.session_state.get("multitrip_assignments")
-            saved_source = st.session_state.get("multitrip_base_solution")
-            if saved_assignments and saved_source == "Tab6 Independent ALNS+MIP":
-                st.markdown("### Multi-Trip Rotalar ve Araç Atamaları")
-                rows = []
-                for v in saved_assignments:
-                    rows.append({
-                        "Araç": f"Araç {v['vehicle_id']}",
-                        "Görev Sayısı": int(v["num_trips"]),
-                        "Süre (dk)": round(v["time_min"], 1),
-                        "Mesafe (km)": round(v["distance_km"], 2),
-                        "Yük (desi)": round(v["load_desi"], 0),
-                        "Enerji (kWh)": round(v["energy_kwh"], 2),
-                        "Kalan Enerji (kWh)": round(v["remaining_energy_kwh"], 2),
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     # ---------- TAB 5: Solution Maps ----------
     with evrp_tab5:
@@ -1960,6 +1917,7 @@ with tab6:
 
         tabu_result = st.session_state.get("tabu_result")
         ga_routes = st.session_state.get("ga_best_routes")
+        alns_routes = st.session_state.get("alns_routes")
         mt_assignments = st.session_state.get("multitrip_assignments")
         data = st.session_state.get("ortools_data")
         df_orders = st.session_state.get("orders_df")
@@ -1969,16 +1927,17 @@ with tab6:
         has_tabu = tabu_result is not None and tabu_result.get(
             "solution") is not None
         has_ga = ga_routes is not None
+        has_alns = alns_routes is not None
         has_mt = mt_assignments is not None and len(mt_assignments) > 0
 
         if data is None or df_orders is None:
             st.warning(
                 "Önce 'Problem Kurulumu' sekmesinde EVRP modelini oluşturun.")
-        elif not has_tabu and not has_ga and not has_mt:
-            st.info("Önce Tabu Search, GA veya Multi-Trip çözümünü oluşturun.")
+        elif not has_tabu and not has_ga and not has_alns and not has_mt:
+            st.info("Önce Tabu Search, GA, ALNS veya Multi-Trip çözümünü oluşturun.")
         else:
             # Display based on what's available
-            if has_tabu or has_ga or has_mt:
+            if has_tabu or has_ga or has_alns or has_mt:
                 st.markdown("### 🔄 Çözüm Karşılaştırması")
                 st.info("Aşağıdan görmek istediğiniz çözüm türlerini seçin. Araç filtresi tüm seçili çözüm türleri için ortaktır.")
 
@@ -2018,7 +1977,6 @@ with tab6:
                     load = 0.0
                     energy = 0.0
                     prev = depot
-                    cum_load = 0.0
 
                     for node in route:
                         if node >= len(loads):
@@ -2029,16 +1987,17 @@ with tab6:
 
                         km += d_km
                         time += t_min
-                        energy += 0.436 * d_km + 0.002 * cum_load
+                        from_node_desi = float(loads[prev]) if prev != depot else 0.0
+                        energy += 0.436 * d_km + 0.002 * from_node_desi
                         load += node_load
-                        cum_load += node_load
                         prev = node
 
                     d_km = float(D[prev, depot])
                     t_min = float(T[prev, depot])
                     km += d_km
                     time += t_min
-                    energy += 0.436 * d_km + 0.002 * cum_load
+                    from_node_desi = float(loads[prev]) if prev != depot else 0.0
+                    energy += 0.436 * d_km + 0.002 * from_node_desi
 
                     return {
                         "km": km,
@@ -2059,12 +2018,14 @@ with tab6:
                                 combined_route.append(depot)
                         mt_routes.append(combined_route)
 
-                copt1, copt2, copt3 = st.columns(3)
+                copt1, copt2, copt3, copt4 = st.columns(4)
                 with copt1:
                     show_tabu = st.checkbox("Tabu", value=has_tabu, disabled=not has_tabu, key="map_show_tabu")
                 with copt2:
                     show_ga = st.checkbox("GA", value=has_ga, disabled=not has_ga, key="map_show_ga")
                 with copt3:
+                    show_alns = st.checkbox("ALNS", value=has_alns, disabled=not has_alns, key="map_show_alns")
+                with copt4:
                     show_mt = st.checkbox("Multi-Trip", value=has_mt, disabled=not has_mt, key="map_show_mt")
 
                 solution_counts = []
@@ -2072,6 +2033,8 @@ with tab6:
                     solution_counts.append(len(tabu_routes))
                 if show_ga:
                     solution_counts.append(len(ga_routes))
+                if show_alns:
+                    solution_counts.append(len(alns_routes))
                 if show_mt:
                     solution_counts.append(len(mt_routes))
 
@@ -2110,6 +2073,8 @@ with tab6:
                         selected_methods.append("tabu")
                     if show_ga:
                         selected_methods.append("ga")
+                    if show_alns:
+                        selected_methods.append("alns")
                     if show_mt:
                         selected_methods.append("mt")
 
@@ -2142,6 +2107,23 @@ with tab6:
                                 rows = []
                                 for i in selected_vehicles:
                                     route = ga_routes[i] if i < len(ga_routes) else []
+                                    rm = route_metrics(route)
+                                    if route:
+                                        rows.append({
+                                            "Araç": f"Araç {i+1}",
+                                            "Müşteri": rm["customers"],
+                                            "Süre (dk)": round(rm["time"], 1),
+                                            "Mesafe (km)": round(rm["km"], 2),
+                                            "Yük (desi)": round(rm["load"], 0),
+                                            "Enerji (kWh)": round(rm["energy"], 2),
+                                        })
+                            elif method_name == "alns":
+                                st.markdown("#### 🧩 ALNS")
+                                selected_routes = [alns_routes[i] for i in selected_vehicles if i < len(alns_routes) and alns_routes[i]]
+                                panel_key = "comparison_map_alns_filtered"
+                                rows = []
+                                for i in selected_vehicles:
+                                    route = alns_routes[i] if i < len(alns_routes) else []
                                     rm = route_metrics(route)
                                     if route:
                                         rows.append({
@@ -2548,21 +2530,23 @@ with tab7:
     data = st.session_state.get("ortools_data")
     tabu_result = st.session_state.get("tabu_result")
     ga_routes = st.session_state.get("ga_best_routes")
+    alns_routes = st.session_state.get("alns_routes")
     df_orders = st.session_state.get("orders_df")
 
     tabu_ran = tabu_result is not None
     has_tabu = tabu_result is not None and tabu_result.get("solution") is not None
     has_ga = ga_routes is not None
+    has_alns = alns_routes is not None
     if data is None:
         st.warning("⚠️ Önce EVRP modelini oluşturun.")
-    elif not has_tabu and not has_ga:
+    elif not has_tabu and not has_ga and not has_alns:
         if tabu_ran:
             st.warning("⚠️ Tabu çalıştırıldı ancak geçerli çözüm bulunamadı. 6️⃣ Problem Çözümü sekmesindeki çözücü logunu kontrol edin veya araç sayısı/zaman limiti artırın.")
             if tabu_result.get("log"):
                 with st.expander("Tabu Solver Log (Özet)"):
                     st.text(tabu_result.get("log", "")[:4000])
         else:
-            st.warning("⚠️ Önce 6️⃣ Problem Çözümü sekmesinde Tabu veya GA çalıştırın.")
+            st.warning("⚠️ Önce 6️⃣ Problem Çözümü sekmesinde Tabu, GA veya ALNS çalıştırın.")
     else:
         D = np.array(data["distance_km"], dtype=float)
         T = np.array(data["time_min"], dtype=float)
@@ -2592,7 +2576,6 @@ with tab7:
             total_time = 0.0
             total_load = 0.0
             total_energy = 0.0
-            cum_load = 0.0
             prev = depot
 
             for node in route:
@@ -2602,9 +2585,9 @@ with tab7:
                 t_min = float(T[prev, node])
                 total_km += d_km
                 total_time += t_min + float(service[node])
-                total_energy += 0.436 * d_km + 0.002 * cum_load
+                from_node_desi = float(loads[prev]) if prev != depot else 0.0
+                total_energy += 0.436 * d_km + 0.002 * from_node_desi
                 node_load = float(loads[node])
-                cum_load += node_load
                 total_load += node_load
                 prev = node
 
@@ -2612,7 +2595,8 @@ with tab7:
             t_min = float(T[prev, depot])
             total_km += d_km
             total_time += t_min
-            total_energy += 0.436 * d_km + 0.002 * cum_load
+            from_node_desi = float(loads[prev]) if prev != depot else 0.0
+            total_energy += 0.436 * d_km + 0.002 * from_node_desi
 
             return {
                 "distance_km": total_km,
@@ -2626,6 +2610,8 @@ with tab7:
             source_options.append("Tabu Search")
         if has_ga:
             source_options.append("Genetic Algorithm")
+        if has_alns:
+            source_options.append("ALNS")
 
         selected_source = st.selectbox(
             "Baz çözüm",
@@ -2636,6 +2622,8 @@ with tab7:
 
         if selected_source == "Tabu Search":
             all_routes = _extract_routes_from_tabu(tabu_result, int(data["num_vehicles"]), depot)
+        elif selected_source == "ALNS":
+            all_routes = alns_routes
         else:
             all_routes = ga_routes
 
@@ -2658,7 +2646,7 @@ with tab7:
 
         if not original_jobs:
             st.info("Seçilen çözümde servis edilen rota bulunamadı.")
-            st.stop()
+            st.warning("Tab 7 bu kaynakla hesaplanamadı; yine de Tab 8 kullanılabilir.")
 
         st.markdown("### Orijinal Çözüm (Tek Görev / Araç)")
         st.dataframe(pd.DataFrame(original_rows), use_container_width=True)
@@ -2698,79 +2686,129 @@ with tab7:
             f"Toplam batarya: {battery_capacity:.2f} kWh | Kullanılabilir enerji (rezerv sonrası): {usable_energy:.2f} kWh"
         )
 
-        if st.button("🚀 Multi-Trip Optimizasyonu Çalıştır", type="primary", key="run_multitrip"):
-            with st.spinner("Multi-trip araç atamaları hazırlanıyor..."):
-                feasible_jobs = []
-                infeasible = []
-                for j in original_jobs:
-                    if j["time_min"] > max_shift_duration:
-                        infeasible.append((j["job_id"], "süre"))
-                        continue
-                    if j["energy_kwh"] > usable_energy:
-                        infeasible.append((j["job_id"], "enerji"))
-                        continue
-                    feasible_jobs.append(dict(j))
+        st.markdown("#### Multi-Trip Optimizasyon Yöntemi")
+        mt_optimizer = st.selectbox(
+            "Yöntem",
+            ["ALNS + MIP", "Tabu + MIP", "Genetik Algoritma + MIP"],
+            index=0,
+            key="multitrip_optimizer",
+        )
 
-                if infeasible:
-                    msg = ", ".join([f"G{jid} ({reason})" for jid, reason in infeasible[:10]])
-                    st.warning(
-                        "Atanamaz görevler atlandı: "
-                        f"{msg}. Bu görevler tek başına bile enerji/süre limitine sığmadığı için "
-                        "multi-trip atamasına dahil edilmedi."
+        st.markdown("#### Seçili Yöntem Parametreleri")
+        al1, al2, al3, al4 = st.columns(4)
+        with al1:
+            mt_alns_iterations = st.number_input(
+                "İterasyon / Generasyon",
+                min_value=50,
+                max_value=5000,
+                value=400,
+                step=50,
+                key="multitrip_alns_iterations",
+            )
+        with al2:
+            mt_alns_destroy_rate = st.slider(
+                "Destroy / Mutasyon oranı",
+                min_value=0.10,
+                max_value=0.60,
+                value=0.25,
+                step=0.05,
+                key="multitrip_alns_destroy_rate",
+            )
+        with al3:
+            mt_mip_time_limit = st.number_input(
+                "MIP polishing süre (sn)",
+                min_value=1,
+                max_value=30,
+                value=5,
+                step=1,
+                key="multitrip_mip_time_limit",
+            )
+        with al4:
+            mt_alns_seed = st.number_input(
+                "Random seed",
+                min_value=0,
+                value=42,
+                key="multitrip_alns_seed",
+            )
+
+        mt_ga_population = st.number_input(
+            "GA popülasyon boyutu (sadece GA+MIP için)",
+            min_value=8,
+            max_value=200,
+            value=30,
+            step=2,
+            key="multitrip_ga_population",
+        )
+
+        if st.button("🚀 Multi-Trip Optimizasyonu Çalıştır", type="primary", key="run_multitrip"):
+            from utils.alns_multitrip_solver import (
+                solve_multitrip_alns_mip,
+                solve_multitrip_tabu_mip,
+                solve_multitrip_ga_mip,
+            )
+
+            with st.spinner(f"{mt_optimizer} ile görevler araçlara atanıyor..."):
+                if mt_optimizer == "ALNS + MIP":
+                    mt_result = solve_multitrip_alns_mip(
+                        jobs=original_jobs,
+                        max_shift_duration=float(max_shift_duration),
+                        usable_energy=float(usable_energy),
+                        depot_service_time=float(depot_service_time),
+                        battery_capacity=float(battery_capacity),
+                        iterations=int(mt_alns_iterations),
+                        destroy_rate=float(mt_alns_destroy_rate),
+                        seed=int(mt_alns_seed),
+                        mip_time_limit_s=int(mt_mip_time_limit),
+                    )
+                elif mt_optimizer == "Tabu + MIP":
+                    mt_result = solve_multitrip_tabu_mip(
+                        jobs=original_jobs,
+                        max_shift_duration=float(max_shift_duration),
+                        usable_energy=float(usable_energy),
+                        depot_service_time=float(depot_service_time),
+                        battery_capacity=float(battery_capacity),
+                        iterations=int(mt_alns_iterations),
+                        tabu_tenure=max(5, int(round(mt_alns_destroy_rate * 100))),
+                        seed=int(mt_alns_seed),
+                        mip_time_limit_s=int(mt_mip_time_limit),
+                    )
+                else:
+                    mt_result = solve_multitrip_ga_mip(
+                        jobs=original_jobs,
+                        max_shift_duration=float(max_shift_duration),
+                        usable_energy=float(usable_energy),
+                        depot_service_time=float(depot_service_time),
+                        battery_capacity=float(battery_capacity),
+                        iterations=int(mt_alns_iterations),
+                        mutation_rate=float(mt_alns_destroy_rate),
+                        seed=int(mt_alns_seed),
+                        mip_time_limit_s=int(mt_mip_time_limit),
+                        population_size=int(mt_ga_population),
                     )
 
-                remaining = sorted(feasible_jobs, key=lambda x: x["time_min"], reverse=True)
-                vehicle_assignments = []
-                vehicle_id = 1
+            vehicle_assignments = mt_result.get("assignments", [])
+            dropped_jobs = mt_result.get("dropped_jobs", [])
 
-                while remaining:
-                    v_jobs = []
-                    v_time = 0.0
-                    v_energy = 0.0
-                    v_dist = 0.0
-                    v_load = 0.0
-                    v_customers = 0
+            if dropped_jobs:
+                msg = ", ".join([f"G{j.get('job_id', '?')} (süre/enerji aşımı)" for j in dropped_jobs[:10]])
+                st.warning(
+                    f"{len(dropped_jobs)} görev atanamadı: {msg}. "
+                    "Bu görevler tek başına bile enerji/süre limitini aştığı için "
+                    "multi-trip atamasına dahil edilmedi."
+                )
 
-                    picked = []
-                    for cand in list(remaining):
-                        extra_time = cand["time_min"] + (depot_service_time if v_jobs else 0.0)
-                        if (v_time + extra_time <= max_shift_duration) and (v_energy + cand["energy_kwh"] <= usable_energy):
-                            v_jobs.append(cand)
-                            v_time += extra_time
-                            v_energy += cand["energy_kwh"]
-                            v_dist += cand["distance_km"]
-                            v_load += cand["load_desi"]
-                            v_customers += len(cand["route"])
-                            picked.append(cand)
+            st.session_state["multitrip_assignments"] = vehicle_assignments
+            st.session_state["multitrip_original_jobs"] = original_jobs
+            st.session_state["multitrip_base_solution"] = selected_source
+            st.session_state["multitrip_usable_energy"] = usable_energy
+            st.session_state["multitrip_optimizer_used"] = mt_optimizer
 
-                    if not picked:
-                        hard = remaining.pop(0)
-                        v_jobs = [hard]
-                        v_time = hard["time_min"]
-                        v_energy = hard["energy_kwh"]
-                        v_dist = hard["distance_km"]
-                        v_load = hard["load_desi"]
-                        v_customers = len(hard["route"])
-                    else:
-                        for p in picked:
-                            remaining.remove(p)
-
-                    vehicle_assignments.append({
-                        "vehicle_id": vehicle_id,
-                        "jobs": v_jobs,
-                        "num_trips": len(v_jobs),
-                        "time_min": v_time,
-                        "distance_km": v_dist,
-                        "load_desi": v_load,
-                        "energy_kwh": v_energy,
-                        "remaining_energy_kwh": max(0.0, battery_capacity - v_energy),
-                    })
-                    vehicle_id += 1
-
-                st.session_state["multitrip_assignments"] = vehicle_assignments
-                st.session_state["multitrip_original_jobs"] = original_jobs
-                st.session_state["multitrip_base_solution"] = selected_source
-                st.session_state["multitrip_usable_energy"] = usable_energy
+            st.text_area(
+                f"{mt_optimizer} Log",
+                value=mt_result.get("log", ""),
+                height=180,
+                key="multitrip_alns_log",
+            )
 
         saved_assignments = st.session_state.get("multitrip_assignments")
         saved_source = st.session_state.get("multitrip_base_solution")
@@ -2779,6 +2817,8 @@ with tab7:
         if saved_assignments and saved_source == selected_source and saved_original:
             st.markdown("---")
             st.markdown("### Sonuç Özeti")
+            used_optimizer = st.session_state.get("multitrip_optimizer_used", "ALNS + MIP")
+            st.caption(f"Atama yöntemi: {used_optimizer}")
 
             orig_total_time = sum(x["time_min"] for x in saved_original)
             orig_total_dist = sum(x["distance_km"] for x in saved_original)
@@ -2800,6 +2840,19 @@ with tab7:
             with k4:
                 st.metric("Toplam Enerji (kWh)", f"{mt_total_energy:.2f}", delta=f"{(mt_total_energy - orig_total_energy):.2f}")
 
+            st.markdown("### Multi-Trip Araç / Görev Atamaları")
+            assignment_rows = []
+            for v in saved_assignments:
+                job_ids = [f"G{j.get('job_id', '?')}" for j in v.get("jobs", [])]
+                assignment_rows.append({
+                    "Araç": f"Araç {v.get('vehicle_id', '?')}",
+                    "Görevler": ", ".join(job_ids) if job_ids else "-",
+                    "Görev Sayısı": int(v.get("num_trips", 0)),
+                    "Süre (dk)": round(v.get("time_min", 0.0), 1),
+                    "Enerji (kWh)": round(v.get("energy_kwh", 0.0), 2),
+                })
+            st.dataframe(pd.DataFrame(assignment_rows), use_container_width=True)
+
             st.markdown("### Araç Bazlı Orijinal vs Multi-Trip")
             max_rows = max(len(saved_original), len(saved_assignments))
             compare_rows = []
@@ -2817,7 +2870,9 @@ with tab7:
                     "load_desi": 0.0,
                     "energy_kwh": 0.0,
                     "remaining_energy_kwh": battery_capacity,
+                    "jobs": [],
                 }
+                task_ids = [f"G{j.get('job_id', '?')}" for j in m.get("jobs", [])]
                 compare_rows.append({
                     "Araç": f"Araç {i + 1}",
                     "Orijinal Süre (dk)": round(o["time_min"], 1),
@@ -2833,6 +2888,7 @@ with tab7:
                     "Multi-Trip Enerji (kWh)": round(m["energy_kwh"], 2),
                     "Enerji Farkı (kWh)": round(m["energy_kwh"] - o["energy_kwh"], 2),
                     "Multi-Trip Görev": int(m.get("num_trips", 0)),
+                    "Görev Listesi": ", ".join(task_ids) if task_ids else "-",
                     "Kalan Enerji (kWh)": round(m.get("remaining_energy_kwh", 0.0), 2),
                 })
 
@@ -2945,3 +3001,379 @@ with tab7:
                         render_folium_safe(m_multi, width=550, height=500, key="multitrip_optimized_map_readded")
                     else:
                         st.info("Multi-trip rota bulunamadı.")
+
+
+# =========================================================
+# 8️⃣ SONUÇ GÖSTERİMİ MATRİSİ
+# =========================================================
+with tab8:
+    st.header("8) Sonuç Gösterimi")
+
+    data = st.session_state.get("ortools_data")
+    tabu_result = st.session_state.get("tabu_result")
+    ga_routes = st.session_state.get("ga_best_routes")
+    alns_routes = st.session_state.get("alns_routes")
+
+    if data is None:
+        st.warning("Önce EVRP modelini oluşturun.")
+    else:
+        D = np.array(data["distance_km"], dtype=float)
+        T = np.array(data["time_min"], dtype=float)
+        loads = np.array(data["demand_desi"], dtype=float)
+        service = np.array(data.get("service_min", np.zeros(len(loads))), dtype=float)
+        depot = int(data.get("depot", 0))
+        battery_capacity = float(data.get("battery_capacity", 100.0))
+
+        def _extract_routes_from_tabu_result(result, num_vehicles, dep):
+            routes = []
+            routing = result["routing"]
+            manager = result["manager"]
+            solution = result["solution"]
+            for v in range(num_vehicles):
+                idx = routing.Start(v)
+                route = []
+                while not routing.IsEnd(idx):
+                    node = manager.IndexToNode(idx)
+                    if node != dep:
+                        route.append(node)
+                    idx = solution.Value(routing.NextVar(idx))
+                routes.append(route)
+            return routes
+
+        def _route_metrics(route):
+            total_km = 0.0
+            total_time = 0.0
+            total_load = 0.0
+            total_energy = 0.0
+            prev = depot
+
+            for node in route:
+                if node < 0 or node >= len(loads):
+                    continue
+                d_km = float(D[prev, node])
+                t_min = float(T[prev, node])
+                total_km += d_km
+                total_time += t_min + float(service[node])
+                from_node_desi = float(loads[prev]) if prev != depot else 0.0
+                total_energy += 0.436 * d_km + 0.002 * from_node_desi
+                total_load += float(loads[node])
+                prev = node
+
+            d_km = float(D[prev, depot])
+            t_min = float(T[prev, depot])
+            total_km += d_km
+            total_time += t_min
+            from_node_desi = float(loads[prev]) if prev != depot else 0.0
+            total_energy += 0.436 * d_km + 0.002 * from_node_desi
+
+            return {
+                "distance_km": total_km,
+                "time_min": total_time,
+                "load_desi": total_load,
+                "energy_kwh": total_energy,
+            }
+
+        one_trip_sources = {}
+
+        has_tabu = tabu_result is not None and tabu_result.get("solution") is not None
+        if has_tabu:
+            one_trip_sources["Tabu"] = _extract_routes_from_tabu_result(
+                tabu_result,
+                int(data["num_vehicles"]),
+                depot,
+            )
+
+        if ga_routes is not None:
+            one_trip_sources["GA"] = ga_routes
+
+        if alns_routes is not None:
+            one_trip_sources["ALNS"] = alns_routes
+
+        if not one_trip_sources:
+            st.warning("Önce Tabu, GA veya ALNS tek-tur çözümü çalıştırın.")
+        else:
+            st.markdown("### Matris Parametreleri")
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                max_shift_duration = st.number_input(
+                    "Maksimum vardiya süresi (dk)",
+                    min_value=240,
+                    max_value=720,
+                    value=int(st.session_state.get("multitrip_max_shift", 540)),
+                    step=30,
+                    key="tab8_max_shift",
+                )
+            with p2:
+                depot_service_time = st.number_input(
+                    "Depo servis süresi (dk)",
+                    min_value=0,
+                    max_value=60,
+                    value=int(st.session_state.get("multitrip_depot_service", 15)),
+                    step=5,
+                    key="tab8_depot_service",
+                )
+            with p3:
+                min_return_pct = st.number_input(
+                    "Minimum dönüş şarjı (%)",
+                    min_value=0,
+                    max_value=90,
+                    value=int(st.session_state.get("multitrip_min_return_pct", 20)),
+                    step=5,
+                    key="tab8_min_return_pct",
+                )
+
+            q1, q2, q3, q4 = st.columns(4)
+            with q1:
+                mt_iterations = st.number_input(
+                    "İterasyon / Generasyon",
+                    min_value=50,
+                    max_value=5000,
+                    value=400,
+                    step=50,
+                    key="tab8_iterations",
+                )
+            with q2:
+                mt_rate = st.slider(
+                    "Destroy / Mutasyon oranı",
+                    min_value=0.10,
+                    max_value=0.60,
+                    value=0.25,
+                    step=0.05,
+                    key="tab8_rate",
+                )
+            with q3:
+                mt_seed = st.number_input(
+                    "Random seed",
+                    min_value=0,
+                    value=42,
+                    key="tab8_seed",
+                )
+            with q4:
+                mt_mip_time = st.number_input(
+                    "MIP polishing süre (sn)",
+                    min_value=1,
+                    max_value=30,
+                    value=5,
+                    step=1,
+                    key="tab8_mip_time",
+                )
+
+            ga_population = st.number_input(
+                "GA popülasyon boyutu (GA+MIP)",
+                min_value=8,
+                max_value=200,
+                value=30,
+                step=2,
+                key="tab8_ga_population",
+            )
+
+            usable_energy = battery_capacity * (1.0 - float(min_return_pct) / 100.0)
+            st.caption(
+                f"Toplam batarya: {battery_capacity:.2f} kWh | Kullanılabilir enerji: {usable_energy:.2f} kWh"
+            )
+
+            if st.button("🧮 3x3 Sonuç Matrisini Hesapla", key="tab8_run_matrix", type="primary"):
+                try:
+                    # Check if we have one-trip solutions
+                    st.info("🔍 Tab 7 çözümleri kontrol ediliyor...")
+                    
+                    if not one_trip_sources:
+                        st.error("❌ Hata: Bir-tur çözümleri bulunamadı. Lütfen önce Tab 7'de en az bir optimizer (Tabu, GA veya ALNS) çalıştırın.")
+                        st.stop()
+                    
+                    available_sources = list(one_trip_sources.keys())
+                    st.success(f"✅ Bulunan bir-tur çözümleri: {', '.join(available_sources)}")
+
+                    from utils.alns_multitrip_solver import (
+                        solve_multitrip_alns_mip,
+                        solve_multitrip_tabu_mip,
+                        solve_multitrip_ga_mip,
+                    )
+
+                    optimizer_names = ["ALNS+MIP", "Tabu+MIP", "GA+MIP"]
+                    matrix_data = {
+                        src_name: {opt_name: "-" for opt_name in optimizer_names}
+                        for src_name in ["Tabu", "GA", "ALNS"]
+                    }
+                    detail_rows = []
+
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    total_steps = len(one_trip_sources) * len(optimizer_names)
+                    current_step = 0
+
+                    for src_name, routes in one_trip_sources.items():
+                        valid_routes = [r for r in routes if r]
+                        if not valid_routes:
+                            st.warning(f"⚠️ {src_name}: Geçerli rota yok, atlanıyor...")
+                            continue
+
+                        status_text.text(f"🔄 {src_name} çözümü işleniyor...")
+                        st.info(f"📊 {src_name}: {len(valid_routes)} araç ile çalışılıyor")
+
+                        ot_runtime_map = {
+                            "Tabu": st.session_state.get("tabu_runtime_s"),
+                            "GA": st.session_state.get("ga_runtime_s"),
+                            "ALNS": st.session_state.get("alns_runtime_s"),
+                        }
+                        one_trip_runtime = ot_runtime_map.get(src_name)
+
+                        one_jobs = []
+                        for i, route in enumerate(valid_routes, start=1):
+                            m = _route_metrics(route)
+                            one_jobs.append(
+                                {
+                                    "job_id": i,
+                                    "route": route,
+                                    "time_min": m["time_min"],
+                                    "distance_km": m["distance_km"],
+                                    "load_desi": m["load_desi"],
+                                    "energy_kwh": m["energy_kwh"],
+                                }
+                            )
+
+                        one_trip_vehicles = len(valid_routes)
+                        one_trip_energy = sum(j["energy_kwh"] for j in one_jobs)
+
+                        import time
+                        
+                        # ALNS+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + ALNS+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_alns = solve_multitrip_alns_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                destroy_rate=float(mt_rate),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                            )
+                            rt_alns = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + ALNS+MIP hatası: {str(e)}")
+                            rt_alns = 0
+                            res_alns = {"assignments": []}
+
+                        # Tabu+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + Tabu+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_tabu = solve_multitrip_tabu_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                tabu_tenure=max(5, int(round(float(mt_rate) * 100))),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                            )
+                            rt_tabu = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + Tabu+MIP hatası: {str(e)}")
+                            rt_tabu = 0
+                            res_tabu = {"assignments": []}
+
+                        # GA+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + GA+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_ga = solve_multitrip_ga_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                mutation_rate=float(mt_rate),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                                population_size=int(ga_population),
+                            )
+                            rt_ga = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + GA+MIP hatası: {str(e)}")
+                            rt_ga = 0
+                            res_ga = {"assignments": []}
+
+                        results = {
+                            "ALNS+MIP": (res_alns, rt_alns),
+                            "Tabu+MIP": (res_tabu, rt_tabu),
+                            "GA+MIP": (res_ga, rt_ga),
+                        }
+
+                        for opt_name, packed in results.items():
+                            res, mt_runtime = packed
+                            assignments = res.get("assignments", [])
+                            if not assignments:
+                                st.warning(f"⚠️ {src_name} + {opt_name}: Atama yok")
+                                continue
+
+                            mt_vehicles = len(assignments)
+                            mt_energy = sum(float(a.get("energy_kwh", 0.0)) for a in assignments)
+                            delta_vehicles = mt_vehicles - one_trip_vehicles
+                            delta_energy = mt_energy - one_trip_energy
+                            ot_runtime_text = f"{float(one_trip_runtime):.1f}" if one_trip_runtime is not None else "-"
+
+                            matrix_data[src_name][opt_name] = (
+                                f"OT: {one_trip_vehicles} araç | {one_trip_energy:.2f} kWh\n"
+                                f"MT: {mt_vehicles} araç | {mt_energy:.2f} kWh\n"
+                                f"OT Süre: {ot_runtime_text} sn | MT Süre: {mt_runtime:.1f} sn\n"
+                                f"ΔAraç: {delta_vehicles:+d} | ΔEnerji: {delta_energy:+.2f} kWh"
+                            )
+
+                            detail_rows.append(
+                                {
+                                    "One-Trip": src_name,
+                                    "Multi-Trip": opt_name,
+                                    "OT Araç": one_trip_vehicles,
+                                    "OT Enerji (kWh)": round(one_trip_energy, 2),
+                                    "OT Süre (sn)": round(float(one_trip_runtime), 1) if one_trip_runtime is not None else None,
+                                    "MT Araç": mt_vehicles,
+                                    "MT Enerji (kWh)": round(mt_energy, 2),
+                                    "MT Süre (sn)": round(mt_runtime, 1),
+                                    "Toplam Süre (sn)": round((float(one_trip_runtime) if one_trip_runtime is not None else 0.0) + mt_runtime, 1),
+                                    "ΔAraç": delta_vehicles,
+                                    "ΔEnerji (kWh)": round(delta_energy, 2),
+                                }
+                            )
+
+                    status_text.text("✅ İşlem tamamlandı!")
+                    progress_bar.progress(1.0)
+
+                    if not detail_rows:
+                        st.error("❌ Sonuç bulunamadı. Lütfen solver parametrelerini kontrol edin.")
+                    else:
+                        st.success(f"✅ {len(detail_rows)} başarılı kombinasyon bulundu!")
+
+                    st.session_state["tab8_matrix_data"] = matrix_data
+                    st.session_state["tab8_matrix_details"] = detail_rows
+
+                except Exception as e:
+                    st.error(f"❌ Beklenmeyen hata: {str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
+
+            matrix_data = st.session_state.get("tab8_matrix_data")
+            detail_rows = st.session_state.get("tab8_matrix_details")
+
+            if matrix_data:
+                st.markdown("### One-Trip vs Multi-Trip 3x3 Matris")
+                matrix_df = pd.DataFrame.from_dict(matrix_data, orient="index")
+                matrix_df.index.name = "One-Trip"
+                st.dataframe(matrix_df, use_container_width=True)
+
+            if detail_rows:
+                st.markdown("### Detay Tablosu (Sadece Çalışan Kombinasyonlar)")
+                st.dataframe(pd.DataFrame(detail_rows), use_container_width=True)
