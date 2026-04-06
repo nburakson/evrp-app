@@ -118,16 +118,20 @@ if "osrm_T" not in st.session_state:
 # cached structures for optimization
 for key in ["evrp_problem", "ortools_data", "tabu_result",
             "ortools_routes", "ga_best_routes", "ga_best_fitness",
-            "alns_result", "alns_routes"]:
+            "alns_result", "alns_routes", "gas_ga_routes",
+            "gas_ga_summary", "gas_ga_best_distance"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
 if "one_trip_cache" not in st.session_state:
     st.session_state["one_trip_cache"] = {}
 
-for k in ["tabu_runtime_s", "ga_runtime_s", "alns_runtime_s", "one_trip_signature"]:
+for k in ["tabu_runtime_s", "ga_runtime_s", "alns_runtime_s", "gas_ga_runtime_s", "one_trip_signature"]:
     if k not in st.session_state:
         st.session_state[k] = None
+
+if "opencage_warning_shown" not in st.session_state:
+    st.session_state["opencage_warning_shown"] = False
 
 # =========================================================
 # CONSTANTS
@@ -209,6 +213,8 @@ EUROPE_DISTRICTS = {
     "sarıyer", "silivri", "şişli", "zeytinburnu", "arnavutköy"
 }
 ALLOWED_CITY = "istanbul"
+GAS_LITERS_PER_100KM = 12.0
+GAS_TANK_LITERS = 80.0
 
 
 def normalize_tr(s: str) -> str:
@@ -230,6 +236,396 @@ def normalize_tr(s: str) -> str:
         .replace("ö", "o")
         .replace("ü", "u")
     )
+
+
+def standardize_excel_columns(df: pd.DataFrame, expected_columns: list[str]) -> pd.DataFrame:
+    """Normalize uploaded Excel headers and map common variants to expected names."""
+    column_aliases = {
+        "id": "id",
+        "il": "il",
+        "ilce": "ilçe",
+        "ilçe": "ilçe",
+        "adres": "adres",
+        "desi": "desi",
+        "urun": "ürün",
+        "ürün": "ürün",
+        "enlem": "enlem",
+        "lat": "enlem",
+        "latitude": "enlem",
+        "boylam": "boylam",
+        "lon": "boylam",
+        "lng": "boylam",
+        "longitude": "boylam",
+    }
+
+    renamed_columns = {}
+    for column in df.columns:
+        normalized = normalize_tr(str(column))
+        renamed_columns[column] = column_aliases.get(normalized, normalized)
+
+    df = df.rename(columns=renamed_columns)
+
+    if df.columns.duplicated().any():
+        duplicate_columns = sorted(set(df.columns[df.columns.duplicated()]))
+        raise ValueError(
+            "Ayni anlama gelen birden fazla kolon bulundu: "
+            + ", ".join(duplicate_columns)
+        )
+
+    missing = [column for column in expected_columns if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "Eksik kolonlar: " + ", ".join(missing)
+        )
+
+    return df
+
+
+@st.cache_data
+def load_product_service_map():
+    """Load product -> service minutes map from Data/Ürün Servis Süreleri.xlsx."""
+    path = DATA_DIR / "Ürün Servis Süreleri.xlsx"
+    df = pd.read_excel(path)
+
+    required_cols = {"Ürün", "Servis Süresi"}
+    if not required_cols.issubset(set(df.columns)):
+        raise ValueError(
+            "Ürün servis süreleri dosyasında 'Ürün' ve 'Servis Süresi' sütunları olmalı."
+        )
+
+    product_map = {}
+    for _, row in df.iterrows():
+        product_raw = str(row.get("Ürün", "")).strip()
+        if not product_raw:
+            continue
+
+        product_key = normalize_tr(product_raw)
+        service_minutes = float(row.get("Servis Süresi", 0) or 0)
+        product_map[product_key] = service_minutes
+
+    return product_map
+
+
+def split_product_list(product_list_text) -> list[str]:
+    if product_list_text is None or pd.isna(product_list_text):
+        return []
+
+    return [
+        item.strip()
+        for item in re.split(r"\s*(?:,|\|)\s*", str(product_list_text))
+        if item and item.strip()
+    ]
+
+
+def calculate_service_minutes_from_products(
+    product_list_text,
+    product_service_map,
+    discount_per_extra_product: float = 0.05,
+):
+    """Calculate service time as product sum with a discount for each extra item."""
+    raw_items = split_product_list(product_list_text)
+    if not raw_items:
+        return 0.0, []
+
+    total_minutes = 0.0
+    unknown_products = []
+
+    for item in raw_items:
+        key = normalize_tr(item)
+        if key in product_service_map:
+            total_minutes += float(product_service_map[key])
+        else:
+            unknown_products.append(item)
+
+    discount_factor = max(0.0, 1.0 - discount_per_extra_product * max(len(raw_items) - 1, 0))
+    total_minutes *= discount_factor
+
+    return round(total_minutes, 2), unknown_products
+
+
+def merge_orders_by_coordinates(df_orders: pd.DataFrame, product_service_map=None):
+    """Merge orders that share identical coordinates into a single stop."""
+    if df_orders is None or df_orders.empty:
+        return df_orders, 0, [], pd.DataFrame()
+
+    def first_non_empty(series: pd.Series):
+        for value in series:
+            if pd.notna(value) and str(value).strip():
+                return value
+        return series.iloc[0] if not series.empty else None
+
+    def sum_numeric(series: pd.Series) -> float:
+        return pd.to_numeric(series, errors="coerce").fillna(0).sum()
+
+    grouped_rows = []
+    unknown_products = set()
+
+    for _, group in df_orders.groupby(["Enlem", "Boylam"], dropna=False, sort=False):
+        merged_row = {}
+
+        for column in ["Street", "Mahalle", "Ilce", "Il"]:
+            if column in group.columns:
+                merged_row[column] = first_non_empty(group[column])
+
+        merged_row["Enlem"] = group["Enlem"].iloc[0]
+        merged_row["Boylam"] = group["Boylam"].iloc[0]
+
+        if "Desi" in group.columns:
+            merged_row["Desi"] = round(sum_numeric(group["Desi"]), 2)
+
+        if "Ürün" in group.columns:
+            merged_products = []
+            for value in group["Ürün"]:
+                merged_products.extend(split_product_list(value))
+
+            merged_row["Ürün"] = ", ".join(merged_products)
+
+            if product_service_map is not None:
+                service_minutes, unknown = calculate_service_minutes_from_products(
+                    merged_row["Ürün"],
+                    product_service_map,
+                )
+                merged_row["Servis Süresi (dk)"] = service_minutes
+                unknown_products.update(unknown)
+
+        elif "Servis Süresi (dk)" in group.columns:
+            merged_row["Servis Süresi (dk)"] = round(sum_numeric(group["Servis Süresi (dk)"]), 2)
+
+        grouped_rows.append(merged_row)
+
+    merged_df = pd.DataFrame(grouped_rows)
+    if merged_df.empty:
+        return merged_df, 0, [], pd.DataFrame()
+
+    over_capacity_df = pd.DataFrame()
+    if "Desi" in merged_df.columns:
+        over_capacity_mask = pd.to_numeric(merged_df["Desi"], errors="coerce").fillna(0) > CAPACITY_DESI
+        if over_capacity_mask.any():
+            over_capacity_df = merged_df.loc[over_capacity_mask].copy()
+            merged_df = merged_df.loc[~over_capacity_mask].copy()
+
+    if merged_df.empty:
+        return merged_df, len(df_orders) - len(grouped_rows), sorted(unknown_products, key=normalize_tr), over_capacity_df
+
+    merged_df.insert(0, "OrderID", range(1, len(merged_df) + 1))
+
+    ordered_columns = [
+        column for column in df_orders.columns
+        if column != "OrderID" and column in merged_df.columns
+    ]
+    for column in ["Ürün", "Servis Süresi (dk)", "Street", "Mahalle", "Ilce", "Il", "Enlem", "Boylam", "Desi"]:
+        if column in merged_df.columns and column not in ordered_columns:
+            ordered_columns.append(column)
+    merged_df = merged_df[["OrderID", *ordered_columns]]
+
+    if not over_capacity_df.empty:
+        extra_columns = [column for column in merged_df.columns if column not in over_capacity_df.columns]
+        for column in extra_columns:
+            over_capacity_df[column] = None
+        over_capacity_df = over_capacity_df[merged_df.columns]
+
+    return merged_df, len(df_orders) - len(grouped_rows), sorted(unknown_products, key=normalize_tr), over_capacity_df
+
+
+def gasoline_route_metrics(route, D, T, loads, service, depot=0):
+    total_km = 0.0
+    total_time = 0.0
+    total_load = 0.0
+    prev = depot
+
+    for node in route:
+        if node < 0 or node >= len(loads):
+            continue
+        total_km += float(D[prev, node])
+        total_time += float(T[prev, node]) + float(service[node])
+        total_load += float(loads[node])
+        prev = node
+
+    total_km += float(D[prev, depot])
+    total_time += float(T[prev, depot])
+    fuel_liters = total_km * (GAS_LITERS_PER_100KM / 100.0)
+
+    return {
+        "distance_km": total_km,
+        "time_min": total_time,
+        "load_desi": total_load,
+        "fuel_liters": fuel_liters,
+        "tank_pct": (fuel_liters / GAS_TANK_LITERS * 100.0) if GAS_TANK_LITERS > 0 else 0.0,
+    }
+
+
+def summarize_gasoline_routes(routes, data):
+    D = np.array(data["distance_km"], dtype=float)
+    T = np.array(data["time_min"], dtype=float)
+    loads = np.array(data["demand_desi"], dtype=float)
+    service = np.array(data.get("service_min", np.zeros(len(loads))), dtype=float)
+    depot = int(data.get("depot", 0))
+
+    vehicle_rows = []
+    for vehicle_idx, route in enumerate(routes, start=1):
+        if not route:
+            continue
+        metrics = gasoline_route_metrics(route, D, T, loads, service, depot=depot)
+        vehicle_rows.append(
+            {
+                "Araç": f"Araç {vehicle_idx}",
+                "Müşteri": len(route),
+                "Mesafe (km)": round(metrics["distance_km"], 2),
+                "Süre (dk)": round(metrics["time_min"], 1),
+                "Yük (desi)": round(metrics["load_desi"], 0),
+                "Benzin (lt)": round(metrics["fuel_liters"], 2),
+                "Depo Kullanımı (%)": round(metrics["tank_pct"], 1),
+            }
+        )
+
+    summary = {
+        "used_vehicles": len(vehicle_rows),
+        "total_km": round(sum(row["Mesafe (km)"] for row in vehicle_rows), 2),
+        "total_time": round(sum(row["Süre (dk)"] for row in vehicle_rows), 1),
+        "total_load": round(sum(row["Yük (desi)"] for row in vehicle_rows), 0),
+        "total_fuel_liters": round(sum(row["Benzin (lt)"] for row in vehicle_rows), 2),
+        "vehicle_rows": vehicle_rows,
+    }
+    return summary
+
+
+def render_gasoline_ga_tab():
+    st.header("9) Benzinli Araç Optimizasyonu")
+
+    gas_data = st.session_state.get("ortools_data")
+    gas_df_orders = st.session_state.get("orders_df")
+
+    if gas_data is None or gas_df_orders is None:
+        st.info("Önce 6️⃣ Problem Çözümü sekmesinde modeli oluşturun.")
+        return
+
+    st.caption(
+        "Bu etap elektrik kısıtlarını kullanmaz. Amaç fonksiyonu yalnızca toplam km minimizasyonudur. "
+        f"Yakıt tüketimi: {GAS_LITERS_PER_100KM:.0f} lt/100 km | Depo: {GAS_TANK_LITERS:.0f} lt"
+    )
+    st.caption(
+        f"Maksimum teorik menzil: {(GAS_TANK_LITERS / GAS_LITERS_PER_100KM) * 100:.1f} km"
+    )
+
+    gg1, gg2, gg3, gg4 = st.columns(4)
+    with gg1:
+        gas_pop_size = st.number_input(
+            "Popülasyon boyutu",
+            min_value=20,
+            max_value=500,
+            value=150,
+            step=10,
+            key="tab9_gas_pop_size",
+        )
+    with gg2:
+        gas_generations = st.number_input(
+            "Generasyon sayısı",
+            min_value=100,
+            max_value=3000,
+            value=600,
+            step=50,
+            key="tab9_gas_generations",
+        )
+    with gg3:
+        gas_mutation_rate = st.slider(
+            "Mutasyon oranı",
+            min_value=0.01,
+            max_value=0.5,
+            value=0.15,
+            step=0.05,
+            key="tab9_gas_mutation_rate",
+        )
+    with gg4:
+        gas_seed = st.number_input(
+            "Random seed",
+            min_value=0,
+            value=321,
+            key="tab9_gas_seed",
+        )
+
+    gas_improvement_mode = st.selectbox(
+        "İyileştirme modu",
+        ["none", "selective", "full"],
+        format_func=lambda x: {
+            "none": "Hızlı (Sadece GA)",
+            "selective": "Dengeli (Seçici 2-opt)",
+            "full": "Maksimum Kalite (Full 2-opt)",
+        }[x],
+        index=1,
+        key="tab9_gas_improvement_mode",
+    )
+
+    if st.button("⛽ Benzinli GA Çalıştır", key="tab9_run_gas_ga"):
+        import time
+
+        all_customers = list(range(1, len(gas_df_orders) + 1))
+        base_routes = [all_customers]
+        sig = st.session_state.get("one_trip_signature")
+        gas_cache_key = (
+            "gas_ga",
+            sig,
+            int(gas_pop_size),
+            int(gas_generations),
+            float(gas_mutation_rate),
+            int(gas_seed),
+            str(gas_improvement_mode),
+        )
+        cached_gas = st.session_state["one_trip_cache"].get(gas_cache_key)
+
+        if cached_gas is not None:
+            gas_routes = cached_gas["routes"]
+            gas_distance = float(cached_gas["best_distance"])
+            gas_runtime = float(cached_gas["runtime_s"])
+            gas_summary = cached_gas["summary"]
+            st.info(f"Önbellekten yüklendi (Benzinli GA, {gas_runtime:.1f} sn).")
+        else:
+            start_time = time.time()
+            with st.spinner("Benzinli araçlar için GA çalışıyor..."):
+                gas_data_for_ga = dict(gas_data)
+                gas_data_for_ga["fuel_liters_per_100km"] = GAS_LITERS_PER_100KM
+                gas_data_for_ga["fuel_tank_liters"] = GAS_TANK_LITERS
+                gas_routes, gas_distance = ga_optimize_sequences(
+                    data=gas_data_for_ga,
+                    base_routes=base_routes,
+                    pop_size=int(gas_pop_size),
+                    generations=int(gas_generations),
+                    objective="distance",
+                    elitism=2,
+                    seed=int(gas_seed),
+                    improvement_mode=gas_improvement_mode,
+                    enforce_energy_constraints=False,
+                    enforce_fuel_constraints=True,
+                )
+            gas_runtime = time.time() - start_time
+            gas_summary = summarize_gasoline_routes(gas_routes, gas_data_for_ga)
+
+            st.session_state["one_trip_cache"][gas_cache_key] = {
+                "routes": gas_routes,
+                "best_distance": gas_distance,
+                "runtime_s": gas_runtime,
+                "summary": gas_summary,
+            }
+
+        st.session_state["gas_ga_routes"] = gas_routes
+        st.session_state["gas_ga_best_distance"] = gas_distance
+        st.session_state["gas_ga_runtime_s"] = gas_runtime
+        st.session_state["gas_ga_summary"] = gas_summary
+
+    gas_ga_summary = st.session_state.get("gas_ga_summary")
+    gas_ga_runtime = st.session_state.get("gas_ga_runtime_s")
+    if gas_ga_summary:
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Kullanılan Araç", gas_ga_summary["used_vehicles"])
+        with m2:
+            st.metric("Toplam Mesafe", f"{gas_ga_summary['total_km']:.2f} km")
+        with m3:
+            st.metric("Toplam Benzin", f"{gas_ga_summary['total_fuel_liters']:.2f} lt")
+        with m4:
+            st.metric("Çözüm Süresi", f"{float(gas_ga_runtime or 0.0):.1f} sn")
+
+        if gas_ga_summary["vehicle_rows"]:
+            st.dataframe(pd.DataFrame(gas_ga_summary["vehicle_rows"]), use_container_width=True)
 
 
 # =========================================================
@@ -288,9 +684,29 @@ def geocode_opencage(query):
     params = {"q": query, "key": OPENCAGE_API_KEY, "limit": 1}
     try:
         r = requests.get(url, params=params, timeout=6)
-        return r.json(), r.url
+        payload = r.json()
+        if isinstance(payload, dict):
+            payload["_http_status"] = r.status_code
+        return payload, r.url
     except Exception:
         return None, None
+
+
+def maybe_warn_opencage_issue(response_json):
+    if not response_json or st.session_state.get("opencage_warning_shown"):
+        return
+
+    status = response_json.get("status") or {}
+    status_code = status.get("code") or response_json.get("_http_status")
+    message = status.get("message")
+
+    if status_code and int(status_code) != 200:
+        st.warning(
+            f"OpenCage kullanılamadı: HTTP/API {status_code}"
+            + (f" - {message}" if message else "")
+            + ". Geocoding işlemi Nominatim fallback ile devam ediyor."
+        )
+        st.session_state["opencage_warning_shown"] = True
 
 
 @lru_cache(maxsize=5000)
@@ -317,6 +733,7 @@ def smart_geocode(street, mahalle, ilce, il):
     # 1) TRY OPENCAGE — FULL QUERY
     # ---------------------------------------------
     oc_json, oc_url = geocode_opencage(full_q_ascii)
+    maybe_warn_opencage_issue(oc_json)
 
     if oc_json and oc_json.get("results"):
         best = oc_json["results"][0]
@@ -369,6 +786,7 @@ def smart_geocode(street, mahalle, ilce, il):
     mahalle_q_ascii = ascii_fallback(mahalle_q)
 
     oc_json2, oc_url2 = geocode_opencage(mahalle_q_ascii)
+    maybe_warn_opencage_issue(oc_json2)
 
     if oc_json2 and oc_json2.get("results"):
         best2 = oc_json2["results"][0]
@@ -628,7 +1046,7 @@ def evrp_feasibility_detailed(data, work_start_min=9*60, work_end_min=18*60):
 # =========================================================
 # MAIN TABS (Adres / Orders / Map / OSRM)
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
     [
         "1️⃣ Adres → Koordinat",
         "2️⃣ Sipariş Oluştur",
@@ -638,6 +1056,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "6️⃣ Problem Çözümü",
         "7️⃣ Çoklu Görev Optimizasyonu",
         "8️⃣ Sonuç Gösterimi",
+        "9️⃣ Benzinli Araçlar",
     ]
 )
 
@@ -712,21 +1131,46 @@ with tab1:
     st.header("📤 Toplu Adres → Koordinat İşleme")
 
     bulk_file = st.file_uploader(
-        "Excel yükle (id, il, ilçe, adres, desi, tahmini servis süresi)",
+        "Excel yükle (id, il, ilçe, adres, desi, ürün)",
         type=["xlsx"],
         key="bulk_upload_tab1",
     )
 
     if bulk_file:
-        df_bulk = pd.read_excel(bulk_file)
-
-        required_cols = ["id", "il", "ilçe",
-                         "adres", "desi", "tahmini servis süresi"]
-        if not all(col in df_bulk.columns for col in required_cols):
+        required_cols = ["id", "il", "ilçe", "adres", "desi", "ürün"]
+        try:
+            df_bulk = standardize_excel_columns(pd.read_excel(bulk_file), required_cols)
+        except ValueError as exc:
             st.error(
-                f"❌ Excel sütunları eksik. Gerekli sütunlar: {', '.join(required_cols)}"
+                f"❌ Excel başlıkları okunamadı: {exc}. Gerekli sütunlar: {', '.join(required_cols)}"
             )
             st.stop()
+
+        product_service_map = load_product_service_map()
+
+        calc_results = df_bulk["ürün"].apply(
+            lambda txt: calculate_service_minutes_from_products(
+                txt,
+                product_service_map,
+            )
+        )
+        df_bulk["hesaplanan servis süresi"] = calc_results.apply(lambda x: x[0])
+        df_bulk["_bilinmeyen_urunler"] = calc_results.apply(lambda x: x[1])
+
+        unknown_set = sorted(
+            {
+                p
+                for sublist in df_bulk["_bilinmeyen_urunler"]
+                for p in sublist
+                if p
+            },
+            key=lambda x: normalize_tr(x),
+        )
+        if unknown_set:
+            st.warning(
+                "⚠️ Ürün servis listesinde bulunamayan ürünler 0 dk kabul edildi: "
+                + ", ".join(unknown_set)
+            )
 
         st.success("✔ Dosya yüklendi.")
         st.dataframe(df_bulk.head(), use_container_width=True)
@@ -778,7 +1222,8 @@ with tab1:
             .agg({
                 "id": lambda x: ",".join(x.astype(str)),
                 "desi": "sum",
-                "tahmini servis süresi": "mean",
+                "ürün": lambda x: " | ".join(x.astype(str)),
+                "hesaplanan servis süresi": "mean",
                 "il": "first",
                 "ilçe": "first",
             })
@@ -826,7 +1271,8 @@ with tab1:
                     "enlem": lat,
                     "boylam": lon,
                     "desi": row["desi"],
-                    "tahmini servis süresi": row["tahmini servis süresi"],
+                    "ürün": row["ürün"],
+                    "hesaplanan servis süresi": round(float(row["hesaplanan servis süresi"]), 2),
                     "il": row["il"],
                     "ilçe": row["ilçe"],
                     "mahalle": mahalle,
@@ -876,7 +1322,7 @@ with tab2:
             "enlem": [40.9000, 40.9500],
             "boylam": [29.3000, 29.3500],
             "desi": [500, 1200],
-            "tahmini servis süresi": [30, 45],
+            "ürün": ["yatak,baza", "beyaz ev tekstili,panel"],
         }
     )
 
@@ -896,36 +1342,58 @@ with tab2:
     st.subheader("📤 Excel'den Sipariş Yükle")
 
     uploaded_file = st.file_uploader(
-        "Excel yükle (id, enlem, boylam, desi, tahmini servis süresi)",
+        "Excel yükle (id, enlem, boylam, desi, ürün)",
         type=["xlsx"],
         key="orders_upload",
     )
 
     if uploaded_file is not None:
         try:
-            df_up = pd.read_excel(uploaded_file)
+            required_cols = ["id", "enlem", "boylam", "desi", "ürün"]
+            df_up = standardize_excel_columns(pd.read_excel(uploaded_file), required_cols)
 
-            required_cols = ["id", "enlem", "boylam",
-                             "desi", "tahmini servis süresi"]
-            missing = [c for c in required_cols if c not in df_up.columns]
+            df_orders = df_up.rename(
+                columns={
+                    "id": "OrderID",
+                    "enlem": "Enlem",
+                    "boylam": "Boylam",
+                    "desi": "Desi",
+                    "ürün": "Ürün",
+                }
+            )
 
-            if missing:
-                st.error(f"❌ Eksik kolonlar: {missing}")
-            else:
-                df_orders = df_up.rename(
-                    columns={
-                        "id": "OrderID",
-                        "enlem": "Enlem",
-                        "boylam": "Boylam",
-                        "desi": "Desi",
-                        "tahmini servis süresi": "Servis Süresi (dk)",
-                    }
+            product_service_map = load_product_service_map()
+            df_orders, merged_count, unknown_set, removed_over_capacity = merge_orders_by_coordinates(
+                df_orders,
+                product_service_map=product_service_map,
+            )
+            if unknown_set:
+                st.warning(
+                    "⚠️ Ürün servis listesinde bulunamayan ürünler 0 dk kabul edildi: "
+                    + ", ".join(unknown_set)
                 )
 
-                st.session_state["orders_df"] = df_orders
+            if merged_count > 0:
+                st.info(f"🔄 Aynı koordinatlı {merged_count} sipariş birleştirildi.")
 
-                st.success("📥 Excel başarıyla yüklendi!")
-                st.dataframe(df_orders, use_container_width=True)
+            if not removed_over_capacity.empty:
+                st.warning(
+                    f"⚠️ Birleştirme sonrası desisi {CAPACITY_DESI} üstüne çıkan {len(removed_over_capacity)} sipariş silindi."
+                )
+                st.dataframe(removed_over_capacity, use_container_width=True)
+
+            if df_orders.empty:
+                st.error("❌ Birleştirme sonrası kapasiteye uygun sipariş kalmadı.")
+                st.stop()
+
+            df_orders = df_orders[
+                ["OrderID", "Enlem", "Boylam", "Desi", "Ürün", "Servis Süresi (dk)"]
+            ]
+
+            st.session_state["orders_df"] = df_orders
+
+            st.success("📥 Excel başarıyla yüklendi!")
+            st.dataframe(df_orders, use_container_width=True)
 
         except Exception as e:
             st.error(f"❌ Excel okunamadı: {e}")
@@ -994,7 +1462,21 @@ with tab2:
                 )
 
             df_orders = pd.DataFrame(orders)
+            df_orders, merged_count, _, removed_over_capacity = merge_orders_by_coordinates(df_orders)
             st.session_state["orders_df"] = df_orders
+
+            if merged_count > 0:
+                st.info(f"🔄 Aynı koordinatlı {merged_count} sipariş birleştirildi.")
+
+            if not removed_over_capacity.empty:
+                st.warning(
+                    f"⚠️ Birleştirme sonrası desisi {CAPACITY_DESI} üstüne çıkan {len(removed_over_capacity)} sipariş silindi."
+                )
+                st.dataframe(removed_over_capacity, use_container_width=True)
+
+            if df_orders.empty:
+                st.error("❌ Birleştirme sonrası kapasiteye uygun sipariş kalmadı.")
+                st.stop()
 
             st.success("📦 Sipariş tablosu oluşturuldu.")
             st.dataframe(df_orders, use_container_width=True)
@@ -1276,6 +1758,10 @@ with tab6:
         st.session_state["tabu_runtime_s"] = None
         st.session_state["ga_runtime_s"] = None
         st.session_state["alns_runtime_s"] = None
+        st.session_state["gas_ga_runtime_s"] = None
+        st.session_state["gas_ga_routes"] = None
+        st.session_state["gas_ga_summary"] = None
+        st.session_state["gas_ga_best_distance"] = None
 
     evrp_tab1, evrp_tab2, evrp_tab3, evrp_tab4, evrp_tab5 = st.tabs(
         [
@@ -1377,6 +1863,10 @@ with tab6:
         st.session_state["ga_best_fitness"] = None
         st.session_state["alns_result"] = None
         st.session_state["alns_routes"] = None
+        st.session_state["gas_ga_routes"] = None
+        st.session_state["gas_ga_summary"] = None
+        st.session_state["gas_ga_best_distance"] = None
+        st.session_state["gas_ga_runtime_s"] = None
 
         st.success("EVRP modeli başarıyla oluşturuldu.")
         st.subheader("🧪 Detaylı Feasibility Analizi")
@@ -3013,7 +3503,6 @@ with tab8:
     tabu_result = st.session_state.get("tabu_result")
     ga_routes = st.session_state.get("ga_best_routes")
     alns_routes = st.session_state.get("alns_routes")
-
     if data is None:
         st.warning("Önce EVRP modelini oluşturun.")
     else:
@@ -3173,135 +3662,197 @@ with tab8:
             )
 
             if st.button("🧮 3x3 Sonuç Matrisini Hesapla", key="tab8_run_matrix", type="primary"):
-                from utils.alns_multitrip_solver import (
-                    solve_multitrip_alns_mip,
-                    solve_multitrip_tabu_mip,
-                    solve_multitrip_ga_mip,
-                )
+                try:
+                    # Check if we have one-trip solutions
+                    st.info("🔍 Tab 7 çözümleri kontrol ediliyor...")
+                    
+                    if not one_trip_sources:
+                        st.error("❌ Hata: Bir-tur çözümleri bulunamadı. Lütfen önce Tab 7'de en az bir optimizer (Tabu, GA veya ALNS) çalıştırın.")
+                        st.stop()
+                    
+                    available_sources = list(one_trip_sources.keys())
+                    st.success(f"✅ Bulunan bir-tur çözümleri: {', '.join(available_sources)}")
 
-                optimizer_names = ["ALNS+MIP", "Tabu+MIP", "GA+MIP"]
-                matrix_data = {
-                    src_name: {opt_name: "-" for opt_name in optimizer_names}
-                    for src_name in ["Tabu", "GA", "ALNS"]
-                }
-                detail_rows = []
+                    from utils.alns_multitrip_solver import (
+                        solve_multitrip_alns_mip,
+                        solve_multitrip_tabu_mip,
+                        solve_multitrip_ga_mip,
+                    )
 
-                for src_name, routes in one_trip_sources.items():
-                    valid_routes = [r for r in routes if r]
-                    if not valid_routes:
-                        continue
-
-                    ot_runtime_map = {
-                        "Tabu": st.session_state.get("tabu_runtime_s"),
-                        "GA": st.session_state.get("ga_runtime_s"),
-                        "ALNS": st.session_state.get("alns_runtime_s"),
+                    optimizer_names = ["ALNS+MIP", "Tabu+MIP", "GA+MIP"]
+                    matrix_data = {
+                        src_name: {opt_name: "-" for opt_name in optimizer_names}
+                        for src_name in ["Tabu", "GA", "ALNS"]
                     }
-                    one_trip_runtime = ot_runtime_map.get(src_name)
+                    detail_rows = []
 
-                    one_jobs = []
-                    for i, route in enumerate(valid_routes, start=1):
-                        m = _route_metrics(route)
-                        one_jobs.append(
-                            {
-                                "job_id": i,
-                                "route": route,
-                                "time_min": m["time_min"],
-                                "distance_km": m["distance_km"],
-                                "load_desi": m["load_desi"],
-                                "energy_kwh": m["energy_kwh"],
-                            }
-                        )
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    total_steps = len(one_trip_sources) * len(optimizer_names)
+                    current_step = 0
 
-                    one_trip_vehicles = len(valid_routes)
-                    one_trip_energy = sum(j["energy_kwh"] for j in one_jobs)
-
-                    import time
-                    mt_start = time.time()
-                    res_alns = solve_multitrip_alns_mip(
-                        jobs=one_jobs,
-                        max_shift_duration=float(max_shift_duration),
-                        usable_energy=float(usable_energy),
-                        depot_service_time=float(depot_service_time),
-                        battery_capacity=float(battery_capacity),
-                        iterations=int(mt_iterations),
-                        destroy_rate=float(mt_rate),
-                        seed=int(mt_seed),
-                        mip_time_limit_s=int(mt_mip_time),
-                    )
-                    rt_alns = time.time() - mt_start
-
-                    mt_start = time.time()
-                    res_tabu = solve_multitrip_tabu_mip(
-                        jobs=one_jobs,
-                        max_shift_duration=float(max_shift_duration),
-                        usable_energy=float(usable_energy),
-                        depot_service_time=float(depot_service_time),
-                        battery_capacity=float(battery_capacity),
-                        iterations=int(mt_iterations),
-                        tabu_tenure=max(5, int(round(float(mt_rate) * 100))),
-                        seed=int(mt_seed),
-                        mip_time_limit_s=int(mt_mip_time),
-                    )
-                    rt_tabu = time.time() - mt_start
-
-                    mt_start = time.time()
-                    res_ga = solve_multitrip_ga_mip(
-                        jobs=one_jobs,
-                        max_shift_duration=float(max_shift_duration),
-                        usable_energy=float(usable_energy),
-                        depot_service_time=float(depot_service_time),
-                        battery_capacity=float(battery_capacity),
-                        iterations=int(mt_iterations),
-                        mutation_rate=float(mt_rate),
-                        seed=int(mt_seed),
-                        mip_time_limit_s=int(mt_mip_time),
-                        population_size=int(ga_population),
-                    )
-                    rt_ga = time.time() - mt_start
-
-                    results = {
-                        "ALNS+MIP": (res_alns, rt_alns),
-                        "Tabu+MIP": (res_tabu, rt_tabu),
-                        "GA+MIP": (res_ga, rt_ga),
-                    }
-
-                    for opt_name, packed in results.items():
-                        res, mt_runtime = packed
-                        assignments = res.get("assignments", [])
-                        if not assignments:
+                    for src_name, routes in one_trip_sources.items():
+                        valid_routes = [r for r in routes if r]
+                        if not valid_routes:
+                            st.warning(f"⚠️ {src_name}: Geçerli rota yok, atlanıyor...")
                             continue
 
-                        mt_vehicles = len(assignments)
-                        mt_energy = sum(float(a.get("energy_kwh", 0.0)) for a in assignments)
-                        delta_vehicles = mt_vehicles - one_trip_vehicles
-                        delta_energy = mt_energy - one_trip_energy
-                        ot_runtime_text = f"{float(one_trip_runtime):.1f}" if one_trip_runtime is not None else "-"
+                        status_text.text(f"🔄 {src_name} çözümü işleniyor...")
+                        st.info(f"📊 {src_name}: {len(valid_routes)} araç ile çalışılıyor")
 
-                        matrix_data[src_name][opt_name] = (
-                            f"OT: {one_trip_vehicles} araç | {one_trip_energy:.2f} kWh\n"
-                            f"MT: {mt_vehicles} araç | {mt_energy:.2f} kWh\n"
-                            f"OT Süre: {ot_runtime_text} sn | MT Süre: {mt_runtime:.1f} sn\n"
-                            f"ΔAraç: {delta_vehicles:+d} | ΔEnerji: {delta_energy:+.2f} kWh"
-                        )
+                        ot_runtime_map = {
+                            "Tabu": st.session_state.get("tabu_runtime_s"),
+                            "GA": st.session_state.get("ga_runtime_s"),
+                            "ALNS": st.session_state.get("alns_runtime_s"),
+                        }
+                        one_trip_runtime = ot_runtime_map.get(src_name)
 
-                        detail_rows.append(
-                            {
-                                "One-Trip": src_name,
-                                "Multi-Trip": opt_name,
-                                "OT Araç": one_trip_vehicles,
-                                "OT Enerji (kWh)": round(one_trip_energy, 2),
-                                "OT Süre (sn)": round(float(one_trip_runtime), 1) if one_trip_runtime is not None else None,
-                                "MT Araç": mt_vehicles,
-                                "MT Enerji (kWh)": round(mt_energy, 2),
-                                "MT Süre (sn)": round(mt_runtime, 1),
-                                "Toplam Süre (sn)": round((float(one_trip_runtime) if one_trip_runtime is not None else 0.0) + mt_runtime, 1),
-                                "ΔAraç": delta_vehicles,
-                                "ΔEnerji (kWh)": round(delta_energy, 2),
-                            }
-                        )
+                        one_jobs = []
+                        for i, route in enumerate(valid_routes, start=1):
+                            m = _route_metrics(route)
+                            one_jobs.append(
+                                {
+                                    "job_id": i,
+                                    "route": route,
+                                    "time_min": m["time_min"],
+                                    "distance_km": m["distance_km"],
+                                    "load_desi": m["load_desi"],
+                                    "energy_kwh": m["energy_kwh"],
+                                }
+                            )
 
-                st.session_state["tab8_matrix_data"] = matrix_data
-                st.session_state["tab8_matrix_details"] = detail_rows
+                        one_trip_vehicles = len(valid_routes)
+                        one_trip_energy = sum(j["energy_kwh"] for j in one_jobs)
+
+                        import time
+                        
+                        # ALNS+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + ALNS+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_alns = solve_multitrip_alns_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                destroy_rate=float(mt_rate),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                            )
+                            rt_alns = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + ALNS+MIP hatası: {str(e)}")
+                            rt_alns = 0
+                            res_alns = {"assignments": []}
+
+                        # Tabu+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + Tabu+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_tabu = solve_multitrip_tabu_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                tabu_tenure=max(5, int(round(float(mt_rate) * 100))),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                            )
+                            rt_tabu = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + Tabu+MIP hatası: {str(e)}")
+                            rt_tabu = 0
+                            res_tabu = {"assignments": []}
+
+                        # GA+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + GA+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_ga = solve_multitrip_ga_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                mutation_rate=float(mt_rate),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                                population_size=int(ga_population),
+                            )
+                            rt_ga = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + GA+MIP hatası: {str(e)}")
+                            rt_ga = 0
+                            res_ga = {"assignments": []}
+
+                        results = {
+                            "ALNS+MIP": (res_alns, rt_alns),
+                            "Tabu+MIP": (res_tabu, rt_tabu),
+                            "GA+MIP": (res_ga, rt_ga),
+                        }
+
+                        for opt_name, packed in results.items():
+                            res, mt_runtime = packed
+                            assignments = res.get("assignments", [])
+                            if not assignments:
+                                st.warning(f"⚠️ {src_name} + {opt_name}: Atama yok")
+                                continue
+
+                            mt_vehicles = len(assignments)
+                            mt_energy = sum(float(a.get("energy_kwh", 0.0)) for a in assignments)
+                            delta_vehicles = mt_vehicles - one_trip_vehicles
+                            delta_energy = mt_energy - one_trip_energy
+                            ot_runtime_text = f"{float(one_trip_runtime):.1f}" if one_trip_runtime is not None else "-"
+
+                            matrix_data[src_name][opt_name] = (
+                                f"OT: {one_trip_vehicles} araç | {one_trip_energy:.2f} kWh\n"
+                                f"MT: {mt_vehicles} araç | {mt_energy:.2f} kWh\n"
+                                f"OT Süre: {ot_runtime_text} sn | MT Süre: {mt_runtime:.1f} sn\n"
+                                f"ΔAraç: {delta_vehicles:+d} | ΔEnerji: {delta_energy:+.2f} kWh"
+                            )
+
+                            detail_rows.append(
+                                {
+                                    "One-Trip": src_name,
+                                    "Multi-Trip": opt_name,
+                                    "OT Araç": one_trip_vehicles,
+                                    "OT Enerji (kWh)": round(one_trip_energy, 2),
+                                    "OT Süre (sn)": round(float(one_trip_runtime), 1) if one_trip_runtime is not None else None,
+                                    "MT Araç": mt_vehicles,
+                                    "MT Enerji (kWh)": round(mt_energy, 2),
+                                    "MT Süre (sn)": round(mt_runtime, 1),
+                                    "Toplam Süre (sn)": round((float(one_trip_runtime) if one_trip_runtime is not None else 0.0) + mt_runtime, 1),
+                                    "ΔAraç": delta_vehicles,
+                                    "ΔEnerji (kWh)": round(delta_energy, 2),
+                                }
+                            )
+
+                    status_text.text("✅ İşlem tamamlandı!")
+                    progress_bar.progress(1.0)
+
+                    if not detail_rows:
+                        st.error("❌ Sonuç bulunamadı. Lütfen solver parametrelerini kontrol edin.")
+                    else:
+                        st.success(f"✅ {len(detail_rows)} başarılı kombinasyon bulundu!")
+
+                    st.session_state["tab8_matrix_data"] = matrix_data
+                    st.session_state["tab8_matrix_details"] = detail_rows
+
+                except Exception as e:
+                    st.error(f"❌ Beklenmeyen hata: {str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
 
             matrix_data = st.session_state.get("tab8_matrix_data")
             detail_rows = st.session_state.get("tab8_matrix_details")
@@ -3315,3 +3866,7 @@ with tab8:
             if detail_rows:
                 st.markdown("### Detay Tablosu (Sadece Çalışan Kombinasyonlar)")
                 st.dataframe(pd.DataFrame(detail_rows), use_container_width=True)
+
+
+with tab9:
+    render_gasoline_ga_tab()
