@@ -3173,135 +3173,197 @@ with tab8:
             )
 
             if st.button("🧮 3x3 Sonuç Matrisini Hesapla", key="tab8_run_matrix", type="primary"):
-                from utils.alns_multitrip_solver import (
-                    solve_multitrip_alns_mip,
-                    solve_multitrip_tabu_mip,
-                    solve_multitrip_ga_mip,
-                )
+                try:
+                    # Check if we have one-trip solutions
+                    st.info("🔍 Tab 7 çözümleri kontrol ediliyor...")
+                    
+                    if not one_trip_sources:
+                        st.error("❌ Hata: Bir-tur çözümleri bulunamadı. Lütfen önce Tab 7'de en az bir optimizer (Tabu, GA veya ALNS) çalıştırın.")
+                        st.stop()
+                    
+                    available_sources = list(one_trip_sources.keys())
+                    st.success(f"✅ Bulunan bir-tur çözümleri: {', '.join(available_sources)}")
 
-                optimizer_names = ["ALNS+MIP", "Tabu+MIP", "GA+MIP"]
-                matrix_data = {
-                    src_name: {opt_name: "-" for opt_name in optimizer_names}
-                    for src_name in ["Tabu", "GA", "ALNS"]
-                }
-                detail_rows = []
+                    from utils.alns_multitrip_solver import (
+                        solve_multitrip_alns_mip,
+                        solve_multitrip_tabu_mip,
+                        solve_multitrip_ga_mip,
+                    )
 
-                for src_name, routes in one_trip_sources.items():
-                    valid_routes = [r for r in routes if r]
-                    if not valid_routes:
-                        continue
-
-                    ot_runtime_map = {
-                        "Tabu": st.session_state.get("tabu_runtime_s"),
-                        "GA": st.session_state.get("ga_runtime_s"),
-                        "ALNS": st.session_state.get("alns_runtime_s"),
+                    optimizer_names = ["ALNS+MIP", "Tabu+MIP", "GA+MIP"]
+                    matrix_data = {
+                        src_name: {opt_name: "-" for opt_name in optimizer_names}
+                        for src_name in ["Tabu", "GA", "ALNS"]
                     }
-                    one_trip_runtime = ot_runtime_map.get(src_name)
+                    detail_rows = []
 
-                    one_jobs = []
-                    for i, route in enumerate(valid_routes, start=1):
-                        m = _route_metrics(route)
-                        one_jobs.append(
-                            {
-                                "job_id": i,
-                                "route": route,
-                                "time_min": m["time_min"],
-                                "distance_km": m["distance_km"],
-                                "load_desi": m["load_desi"],
-                                "energy_kwh": m["energy_kwh"],
-                            }
-                        )
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    total_steps = len(one_trip_sources) * len(optimizer_names)
+                    current_step = 0
 
-                    one_trip_vehicles = len(valid_routes)
-                    one_trip_energy = sum(j["energy_kwh"] for j in one_jobs)
-
-                    import time
-                    mt_start = time.time()
-                    res_alns = solve_multitrip_alns_mip(
-                        jobs=one_jobs,
-                        max_shift_duration=float(max_shift_duration),
-                        usable_energy=float(usable_energy),
-                        depot_service_time=float(depot_service_time),
-                        battery_capacity=float(battery_capacity),
-                        iterations=int(mt_iterations),
-                        destroy_rate=float(mt_rate),
-                        seed=int(mt_seed),
-                        mip_time_limit_s=int(mt_mip_time),
-                    )
-                    rt_alns = time.time() - mt_start
-
-                    mt_start = time.time()
-                    res_tabu = solve_multitrip_tabu_mip(
-                        jobs=one_jobs,
-                        max_shift_duration=float(max_shift_duration),
-                        usable_energy=float(usable_energy),
-                        depot_service_time=float(depot_service_time),
-                        battery_capacity=float(battery_capacity),
-                        iterations=int(mt_iterations),
-                        tabu_tenure=max(5, int(round(float(mt_rate) * 100))),
-                        seed=int(mt_seed),
-                        mip_time_limit_s=int(mt_mip_time),
-                    )
-                    rt_tabu = time.time() - mt_start
-
-                    mt_start = time.time()
-                    res_ga = solve_multitrip_ga_mip(
-                        jobs=one_jobs,
-                        max_shift_duration=float(max_shift_duration),
-                        usable_energy=float(usable_energy),
-                        depot_service_time=float(depot_service_time),
-                        battery_capacity=float(battery_capacity),
-                        iterations=int(mt_iterations),
-                        mutation_rate=float(mt_rate),
-                        seed=int(mt_seed),
-                        mip_time_limit_s=int(mt_mip_time),
-                        population_size=int(ga_population),
-                    )
-                    rt_ga = time.time() - mt_start
-
-                    results = {
-                        "ALNS+MIP": (res_alns, rt_alns),
-                        "Tabu+MIP": (res_tabu, rt_tabu),
-                        "GA+MIP": (res_ga, rt_ga),
-                    }
-
-                    for opt_name, packed in results.items():
-                        res, mt_runtime = packed
-                        assignments = res.get("assignments", [])
-                        if not assignments:
+                    for src_name, routes in one_trip_sources.items():
+                        valid_routes = [r for r in routes if r]
+                        if not valid_routes:
+                            st.warning(f"⚠️ {src_name}: Geçerli rota yok, atlanıyor...")
                             continue
 
-                        mt_vehicles = len(assignments)
-                        mt_energy = sum(float(a.get("energy_kwh", 0.0)) for a in assignments)
-                        delta_vehicles = mt_vehicles - one_trip_vehicles
-                        delta_energy = mt_energy - one_trip_energy
-                        ot_runtime_text = f"{float(one_trip_runtime):.1f}" if one_trip_runtime is not None else "-"
+                        status_text.text(f"🔄 {src_name} çözümü işleniyor...")
+                        st.info(f"📊 {src_name}: {len(valid_routes)} araç ile çalışılıyor")
 
-                        matrix_data[src_name][opt_name] = (
-                            f"OT: {one_trip_vehicles} araç | {one_trip_energy:.2f} kWh\n"
-                            f"MT: {mt_vehicles} araç | {mt_energy:.2f} kWh\n"
-                            f"OT Süre: {ot_runtime_text} sn | MT Süre: {mt_runtime:.1f} sn\n"
-                            f"ΔAraç: {delta_vehicles:+d} | ΔEnerji: {delta_energy:+.2f} kWh"
-                        )
+                        ot_runtime_map = {
+                            "Tabu": st.session_state.get("tabu_runtime_s"),
+                            "GA": st.session_state.get("ga_runtime_s"),
+                            "ALNS": st.session_state.get("alns_runtime_s"),
+                        }
+                        one_trip_runtime = ot_runtime_map.get(src_name)
 
-                        detail_rows.append(
-                            {
-                                "One-Trip": src_name,
-                                "Multi-Trip": opt_name,
-                                "OT Araç": one_trip_vehicles,
-                                "OT Enerji (kWh)": round(one_trip_energy, 2),
-                                "OT Süre (sn)": round(float(one_trip_runtime), 1) if one_trip_runtime is not None else None,
-                                "MT Araç": mt_vehicles,
-                                "MT Enerji (kWh)": round(mt_energy, 2),
-                                "MT Süre (sn)": round(mt_runtime, 1),
-                                "Toplam Süre (sn)": round((float(one_trip_runtime) if one_trip_runtime is not None else 0.0) + mt_runtime, 1),
-                                "ΔAraç": delta_vehicles,
-                                "ΔEnerji (kWh)": round(delta_energy, 2),
-                            }
-                        )
+                        one_jobs = []
+                        for i, route in enumerate(valid_routes, start=1):
+                            m = _route_metrics(route)
+                            one_jobs.append(
+                                {
+                                    "job_id": i,
+                                    "route": route,
+                                    "time_min": m["time_min"],
+                                    "distance_km": m["distance_km"],
+                                    "load_desi": m["load_desi"],
+                                    "energy_kwh": m["energy_kwh"],
+                                }
+                            )
 
-                st.session_state["tab8_matrix_data"] = matrix_data
-                st.session_state["tab8_matrix_details"] = detail_rows
+                        one_trip_vehicles = len(valid_routes)
+                        one_trip_energy = sum(j["energy_kwh"] for j in one_jobs)
+
+                        import time
+                        
+                        # ALNS+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + ALNS+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_alns = solve_multitrip_alns_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                destroy_rate=float(mt_rate),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                            )
+                            rt_alns = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + ALNS+MIP hatası: {str(e)}")
+                            rt_alns = 0
+                            res_alns = {"assignments": []}
+
+                        # Tabu+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + Tabu+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_tabu = solve_multitrip_tabu_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                tabu_tenure=max(5, int(round(float(mt_rate) * 100))),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                            )
+                            rt_tabu = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + Tabu+MIP hatası: {str(e)}")
+                            rt_tabu = 0
+                            res_tabu = {"assignments": []}
+
+                        # GA+MIP
+                        try:
+                            status_text.text(f"🔄 {src_name} + GA+MIP çalışıyor...")
+                            mt_start = time.time()
+                            res_ga = solve_multitrip_ga_mip(
+                                jobs=one_jobs,
+                                max_shift_duration=float(max_shift_duration),
+                                usable_energy=float(usable_energy),
+                                depot_service_time=float(depot_service_time),
+                                battery_capacity=float(battery_capacity),
+                                iterations=int(mt_iterations),
+                                mutation_rate=float(mt_rate),
+                                seed=int(mt_seed),
+                                mip_time_limit_s=int(mt_mip_time),
+                                population_size=int(ga_population),
+                            )
+                            rt_ga = time.time() - mt_start
+                            current_step += 1
+                            progress_bar.progress(min(current_step / total_steps, 1.0))
+                        except Exception as e:
+                            st.error(f"❌ {src_name} + GA+MIP hatası: {str(e)}")
+                            rt_ga = 0
+                            res_ga = {"assignments": []}
+
+                        results = {
+                            "ALNS+MIP": (res_alns, rt_alns),
+                            "Tabu+MIP": (res_tabu, rt_tabu),
+                            "GA+MIP": (res_ga, rt_ga),
+                        }
+
+                        for opt_name, packed in results.items():
+                            res, mt_runtime = packed
+                            assignments = res.get("assignments", [])
+                            if not assignments:
+                                st.warning(f"⚠️ {src_name} + {opt_name}: Atama yok")
+                                continue
+
+                            mt_vehicles = len(assignments)
+                            mt_energy = sum(float(a.get("energy_kwh", 0.0)) for a in assignments)
+                            delta_vehicles = mt_vehicles - one_trip_vehicles
+                            delta_energy = mt_energy - one_trip_energy
+                            ot_runtime_text = f"{float(one_trip_runtime):.1f}" if one_trip_runtime is not None else "-"
+
+                            matrix_data[src_name][opt_name] = (
+                                f"OT: {one_trip_vehicles} araç | {one_trip_energy:.2f} kWh\n"
+                                f"MT: {mt_vehicles} araç | {mt_energy:.2f} kWh\n"
+                                f"OT Süre: {ot_runtime_text} sn | MT Süre: {mt_runtime:.1f} sn\n"
+                                f"ΔAraç: {delta_vehicles:+d} | ΔEnerji: {delta_energy:+.2f} kWh"
+                            )
+
+                            detail_rows.append(
+                                {
+                                    "One-Trip": src_name,
+                                    "Multi-Trip": opt_name,
+                                    "OT Araç": one_trip_vehicles,
+                                    "OT Enerji (kWh)": round(one_trip_energy, 2),
+                                    "OT Süre (sn)": round(float(one_trip_runtime), 1) if one_trip_runtime is not None else None,
+                                    "MT Araç": mt_vehicles,
+                                    "MT Enerji (kWh)": round(mt_energy, 2),
+                                    "MT Süre (sn)": round(mt_runtime, 1),
+                                    "Toplam Süre (sn)": round((float(one_trip_runtime) if one_trip_runtime is not None else 0.0) + mt_runtime, 1),
+                                    "ΔAraç": delta_vehicles,
+                                    "ΔEnerji (kWh)": round(delta_energy, 2),
+                                }
+                            )
+
+                    status_text.text("✅ İşlem tamamlandı!")
+                    progress_bar.progress(1.0)
+
+                    if not detail_rows:
+                        st.error("❌ Sonuç bulunamadı. Lütfen solver parametrelerini kontrol edin.")
+                    else:
+                        st.success(f"✅ {len(detail_rows)} başarılı kombinasyon bulundu!")
+
+                    st.session_state["tab8_matrix_data"] = matrix_data
+                    st.session_state["tab8_matrix_details"] = detail_rows
+
+                except Exception as e:
+                    st.error(f"❌ Beklenmeyen hata: {str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
 
             matrix_data = st.session_state.get("tab8_matrix_data")
             detail_rows = st.session_state.get("tab8_matrix_details")
