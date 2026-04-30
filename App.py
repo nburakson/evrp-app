@@ -322,7 +322,10 @@ def calculate_service_minutes_from_products(
     product_service_map,
     discount_per_extra_product: float = 0.05,
 ):
-    """Calculate service time as product sum with a discount for each extra item."""
+    """Calculate service time as product sum with a discount for each extra item.
+
+    Discount factor is clamped to a minimum of 0.50.
+    """
     raw_items = split_product_list(product_list_text)
     if not raw_items:
         return 0.0, []
@@ -337,7 +340,7 @@ def calculate_service_minutes_from_products(
         else:
             unknown_products.append(item)
 
-    discount_factor = max(0.0, 1.0 - discount_per_extra_product * max(len(raw_items) - 1, 0))
+    discount_factor = max(0.50, 1.0 - discount_per_extra_product * max(len(raw_items) - 1, 0))
     total_minutes *= discount_factor
 
     return round(total_minutes, 2), unknown_products
