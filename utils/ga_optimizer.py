@@ -82,6 +82,8 @@ def _build_cost_context(data):
     service = np.asarray(data["service_min"], dtype=float)
     vehicle_cap = float(data.get("vehicle_cap_desi", 0.0))
     battery_cap = float(data.get("battery_capacity", 0.0))
+    fuel_liters_per_100km = float(data.get("fuel_liters_per_100km", 0.0))
+    fuel_tank_liters = float(data.get("fuel_tank_liters", 0.0))
 
     # Time matrices
     T_static = None
@@ -100,6 +102,8 @@ def _build_cost_context(data):
         "service": service,
         "vehicle_cap": vehicle_cap,
         "battery_cap": battery_cap,
+        "fuel_liters_per_100km": fuel_liters_per_100km,
+        "fuel_tank_liters": fuel_tank_liters,
         "num_vehicles": int(data.get("num_vehicles", 0)),
         "base_energy_per_km": _base_energy_per_km(data),
         "T_static": T_static,
@@ -167,7 +171,28 @@ def route_time_penalty(route, ctx, depot=0, penalty_per_min=1e5) -> float:
     return float(overflow) * float(penalty_per_min)
 
 
-def _build_routes_from_sequence(sequence, ctx):
+def route_fuel_liters(route, ctx, depot=0) -> float:
+    if not route:
+        return 0.0
+
+    D = ctx["D"]
+    liters_per_km = float(ctx.get("fuel_liters_per_100km", 0.0)) / 100.0
+    if liters_per_km <= 0:
+        return 0.0
+
+    total_km = float(D[depot, route[0]])
+    for i in range(len(route) - 1):
+        total_km += float(D[route[i], route[i + 1]])
+    total_km += float(D[route[-1], depot])
+    return total_km * liters_per_km
+
+
+def _build_routes_from_sequence(
+    sequence,
+    ctx,
+    enforce_energy_constraints=True,
+    enforce_fuel_constraints=False,
+):
     """
     Convert a flat customer permutation into vehicle routes while enforcing
     OR-Tools style constraints (capacity, battery, workday).
@@ -177,6 +202,8 @@ def _build_routes_from_sequence(sequence, ctx):
     num_vehicles = ctx["num_vehicles"]
     cap = ctx["vehicle_cap"]
     battery = ctx["battery_cap"]
+    fuel_tank = ctx.get("fuel_tank_liters", 0.0)
+    fuel_per_km = float(ctx.get("fuel_liters_per_100km", 0.0)) / 100.0
     base_energy = ctx["base_energy_per_km"]
     D = ctx["D"]
     depot = ctx["depot"]
@@ -190,15 +217,17 @@ def _build_routes_from_sequence(sequence, ctx):
     current = []
     load = 0.0
     energy = 0.0
+    fuel_liters = 0.0
     t = 0.0
     prev = depot
 
     def finish_route():
-        nonlocal current, load, energy, t, prev
+        nonlocal current, load, energy, fuel_liters, t, prev
         routes.append(current)
         current = []
         load = 0.0
         energy = 0.0
+        fuel_liters = 0.0
         t = 0.0
         prev = depot
 
@@ -217,12 +246,15 @@ def _build_routes_from_sequence(sequence, ctx):
         projected_load = load + demand[node]
         projected_return_energy = leg_energy_kwh_node_proxy(float(D[node, depot]), float(demand[node]))
         projected_energy = energy + leg_energy + projected_return_energy
+        leg_fuel = leg_dist * fuel_per_km
+        projected_fuel = fuel_liters + leg_fuel + float(D[node, depot]) * fuel_per_km
         projected_time = t + travel + svc + _leg_time_min(node, depot, t + travel + svc, ctx)
 
         violates = (
             projected_load > cap
-            or projected_energy > battery
             or projected_time > MAX_ROUTE_MIN
+            or (enforce_energy_constraints and projected_energy > battery)
+            or (enforce_fuel_constraints and fuel_tank > 0 and projected_fuel > fuel_tank)
         )
 
         if violates and v + 1 < num_vehicles:
@@ -237,6 +269,7 @@ def _build_routes_from_sequence(sequence, ctx):
         # Update state
         load += demand[node]
         energy += leg_energy
+        fuel_liters += leg_fuel
         t += travel + svc
         current.append(node)
         prev = node
@@ -251,6 +284,7 @@ def _build_routes_from_sequence(sequence, ctx):
     # penalties for constraint overflows in each route
     cap_penalty = 0.0
     energy_penalty = 0.0
+    fuel_penalty = 0.0
     for r in routes:
         if not r:
             continue
@@ -258,15 +292,21 @@ def _build_routes_from_sequence(sequence, ctx):
         if load_total > cap:
             cap_penalty += (load_total - cap) * 1e5
 
-        used_kwh = leg_energy_kwh_node_proxy(float(D[depot, r[0]]), 0.0)
-        for i in range(len(r) - 1):
-            a, b = r[i], r[i + 1]
-            used_kwh += leg_energy_kwh_node_proxy(float(D[a, b]), float(demand[a]))
-        used_kwh += leg_energy_kwh_node_proxy(float(D[r[-1], depot]), float(demand[r[-1]]))
-        if used_kwh > battery:
-            energy_penalty += (used_kwh - battery) * 1e5
+        if enforce_energy_constraints:
+            used_kwh = leg_energy_kwh_node_proxy(float(D[depot, r[0]]), 0.0)
+            for i in range(len(r) - 1):
+                a, b = r[i], r[i + 1]
+                used_kwh += leg_energy_kwh_node_proxy(float(D[a, b]), float(demand[a]))
+            used_kwh += leg_energy_kwh_node_proxy(float(D[r[-1], depot]), float(demand[r[-1]]))
+            if used_kwh > battery:
+                energy_penalty += (used_kwh - battery) * 1e5
 
-    penalties += cap_penalty + energy_penalty
+        if enforce_fuel_constraints and fuel_tank > 0:
+            used_fuel = route_fuel_liters(r, ctx, depot=depot)
+            if used_fuel > fuel_tank:
+                fuel_penalty += (used_fuel - fuel_tank) * 1e5
+
+    penalties += cap_penalty + energy_penalty + fuel_penalty
     return routes[:num_vehicles], penalties
 
 
@@ -460,7 +500,9 @@ def ga_optimize_sequences(
     objective="energy",
     elitism=2,
     seed=42,
-    improvement_mode="none"
+    improvement_mode="none",
+    enforce_energy_constraints=True,
+    enforce_fuel_constraints=False,
 ):
     random.seed(seed)
 
@@ -470,7 +512,12 @@ def ga_optimize_sequences(
     customers = [n for r in base_routes for n in r]
 
     def evaluate(seq):
-        routes, penalties = _build_routes_from_sequence(seq, ctx)
+        routes, penalties = _build_routes_from_sequence(
+            seq,
+            ctx,
+            enforce_energy_constraints=enforce_energy_constraints,
+            enforce_fuel_constraints=enforce_fuel_constraints,
+        )
         D = ctx["D"]
         depot = ctx["depot"]
 
