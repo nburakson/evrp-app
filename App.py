@@ -1918,8 +1918,132 @@ with tab6:
             st.session_state["selected_weekday"] = weekday
             st.success(f"{selected_day} için trafik matrisleri hazır.")
 
+    # ================= CALCULATE MINIMUM VEHICLES FUNCTION ======================
+    def calculate_minimum_vehicles(
+        df_orders,
+        D,
+        T,
+        max_capacity=CAPACITY_DESI,
+        battery_capacity=BATTERY_CAPACITY,
+        max_work_minutes=9*60,  # 09:00 to 18:00 = 540 minutes
+    ):
+        """
+        Calculate minimum number of vehicles needed using greedy bin-packing approach.
+        Considers capacity, time, and energy constraints.
+        Returns the estimated minimum vehicles needed.
+        """
+        if df_orders is None or len(df_orders) == 0:
+            return 1
+        
+        try:
+            num_orders = len(df_orders)
+            
+            # Extract demands - handle different column names
+            if "desi" in df_orders.columns:
+                demands = np.array(df_orders["desi"], dtype=float)
+            else:
+                demands = np.ones(num_orders, dtype=float)  # Default to 1 if no desi column
+            
+            # Extract service times - handle different column names
+            if "Servis Süresi (dk)" in df_orders.columns:
+                service_times = np.array(df_orders["Servis Süresi (dk)"], dtype=float)
+            else:
+                service_times = np.zeros(num_orders, dtype=float)
+            
+            # Validate inputs
+            if len(demands) == 0 or D is None or T is None:
+                return 1
+            
+            # Start with 1 vehicle and greedily assign orders
+            vehicles = []
+            unassigned_orders = list(range(num_orders))
+            depot = 0
+            
+            while unassigned_orders:
+                # Create new vehicle
+                vehicle_capacity = 0.0
+                vehicle_time = 0.0
+                vehicle_energy = 0.0
+                vehicle_orders = []
+                
+                # Try to add orders to this vehicle (simple greedy)
+                orders_to_remove = []
+                for order_idx in unassigned_orders:
+                    if order_idx >= len(demands):
+                        continue
+                    
+                    order_demand = float(demands[order_idx])
+                    order_service = float(service_times[order_idx]) if order_idx < len(service_times) else 0.0
+                    
+                    # Distance matrix indices: depot is 0, customers are 1 to num_orders
+                    customer_idx = order_idx + 1
+                    
+                    if customer_idx >= D.shape[0] or customer_idx >= T.shape[0]:
+                        continue
+                    
+                    # Distance to order and back to depot
+                    dist_to_order = float(D[depot, customer_idx])
+                    dist_from_order = float(D[customer_idx, depot])
+                    total_dist = dist_to_order + dist_from_order
+                    
+                    # Time needed (travel + service)
+                    time_needed = float(T[depot, customer_idx]) + order_service + float(T[customer_idx, depot])
+                    
+                    # Energy needed (0.436 per km + 0.002 per desi-km considering current load)
+                    energy_needed = 0.436 * total_dist + 0.002 * (vehicle_capacity + order_demand) * total_dist / 1000
+                    
+                    # Check if order fits
+                    can_fit_capacity = (vehicle_capacity + order_demand) <= max_capacity
+                    can_fit_time = (vehicle_time + time_needed) <= max_work_minutes
+                    can_fit_energy = (vehicle_energy + energy_needed) <= battery_capacity * 0.8  # 80% usable
+                    
+                    if can_fit_capacity and can_fit_time and can_fit_energy:
+                        vehicle_capacity += order_demand
+                        vehicle_time += time_needed
+                        vehicle_energy += energy_needed
+                        vehicle_orders.append(order_idx)
+                        orders_to_remove.append(order_idx)
+                
+                # Remove assigned orders
+                for order_idx in orders_to_remove:
+                    unassigned_orders.remove(order_idx)
+                
+                vehicles.append({
+                    "capacity": vehicle_capacity,
+                    "time": vehicle_time,
+                    "energy": vehicle_energy,
+                    "orders": vehicle_orders
+                })
+                
+                # Safety check: if no orders were assigned, force add the first unassigned
+                if not orders_to_remove and unassigned_orders:
+                    order_idx = unassigned_orders.pop(0)
+                    vehicles[-1]["orders"].append(order_idx)
+            
+            return max(len(vehicles), 1)
+        
+        except Exception as e:
+            st.warning(f"⚠️ Minimum araç hesaplaması hatası: {str(e)}. Varsayılan değer kullanılıyor.")
+            return 1
+
     # ================= EVRP MODEL OLUŞTUR ======================
     if st.button("🚀 EVRP Modelini Derle"):
+
+        # Calculate minimum vehicles needed based on constraints
+        min_vehicles = calculate_minimum_vehicles(
+            df_orders=df_orders,
+            D=D,
+            T=T_osrm if st.session_state.get("T_by_hour") is None else st.session_state.get("T_by_hour", {}).get(9, T_osrm),
+            max_capacity=CAPACITY_DESI,
+            battery_capacity=BATTERY_CAPACITY,
+            max_work_minutes=9*60,
+        )
+        
+        # Use the maximum of calculated minimum and user input
+        # (but prefer minimum if it's feasible)
+        actual_num_vehicles = max(min_vehicles, 1)
+        
+        st.info(f"📊 Hesaplanan minimum araç sayısı: **{min_vehicles}** | Kullanıcı girişi: {int(num_vehicles)} → **{actual_num_vehicles}** araç kullanılacak")
 
         T_by_hour = st.session_state.get("T_by_hour")
 
@@ -1929,7 +2053,7 @@ with tab6:
                 df_orders=df_orders,
                 D=D,
                 T=None,  # use T_by_hour
-                num_vehicles=int(num_vehicles),
+                num_vehicles=actual_num_vehicles,
                 T_by_hour=T_by_hour,
                 planning_hour=planning_hour,
             )
@@ -1938,7 +2062,7 @@ with tab6:
                 df_orders=df_orders,
                 D=D,
                 T=T_osrm,
-                num_vehicles=int(num_vehicles),
+                num_vehicles=actual_num_vehicles,
             )
 
         # ⚠️ SERVICE TIMES ARE INCLUDED: Each order's "Servis Süresi (dk)" is extracted from df_orders
@@ -1948,6 +2072,8 @@ with tab6:
         # store
         st.session_state["evrp_problem"] = problem
         st.session_state["ortools_data"] = data
+        st.session_state["calculated_min_vehicles"] = min_vehicles
+        st.session_state["actual_num_vehicles"] = actual_num_vehicles
         st.session_state["tabu_result"] = None
         st.session_state["ortools_routes"] = None
         st.session_state["ga_best_routes"] = None
@@ -3590,7 +3716,7 @@ with tab7:
                 st.info("Harita için gerekli veri eksik (orders/osrm_client).")
             else:
                 original_vehicle_options = [f"Görev {i + 1}" for i in range(len(saved_original))]
-                multitrip_vehicle_options = [f"Görev {v['vehicle_id']}" for v in saved_assignments]
+                multitrip_vehicle_options = [f"Araç {v['vehicle_id']}" for v in saved_assignments]
 
                 btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
                 with btn_col1:
@@ -3637,7 +3763,7 @@ with tab7:
                 multitrip_routes_for_map = []
                 multitrip_labels = []
                 for v in saved_assignments:
-                    vehicle_label = f"Görev {v['vehicle_id']}"
+                    vehicle_label = f"Araç {v['vehicle_id']}"
                     if vehicle_label not in selected_multitrip_vehicles:
                         continue
                     
